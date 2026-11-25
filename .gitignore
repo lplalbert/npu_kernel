@@ -6,3 +6,5 @@ build_out/
 __pycache__/
 *.pyc
 .vscode/
+creds.local
+.env

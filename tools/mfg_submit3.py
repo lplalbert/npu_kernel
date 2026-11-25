@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""提交 mfg 三道题（4 文件结构），处理 429 冷却，并轮询结果。"""
-import json, os, re, subprocess, sys, time
+"""提交 mfg 题目（从仓库 mfg/zips/ 读取 3/4 文件包），处理 429 冷却，并轮询结果。
+用法:  python3 mfg_submit3.py [name ...]   # 不传名字 = 全部 15 题
+凭据从环境变量读: CANNJUDGE_JWT / CANNJUDGE_USER（见 tools/CREDENTIALS.md）。
+"""
+import json, os, re, subprocess, sys, time, zipfile
 
-COOKIE = f"cannjudge_auth={os.environ.get('CANNJUDGE_JWT', '')}"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from probids import MFG, zip_path
+
+JWT = os.environ.get("CANNJUDGE_JWT", "")
+COOKIE = f"cannjudge_auth={JWT}"
 USER_ID = os.environ.get("CANNJUDGE_USER", "<MY_USER_ID>")
 BASE = "https://cannjudge.cn/api"
 
-PROBS = [
-    ("spspmm", "6af276736bd0f9be37a4cb08", "/root/work/mfg/spspmm",
-     ["op_host/spspmm.cpp", "op_kernel/spspmm.cpp",
-      "op_kernel/spspmm_tiling.h", "op_kernel/tiling_key_spspmm.h"]),
-    ("fourier_transform2d", "6af2d6646bd0f9be375ab041", "/root/work/mfg/fouriertransform2d",
-     ["op_host/fourier_transform2_d.cpp", "op_kernel/fourier_transform2_d.cpp",
-      "op_kernel/fourier_transform2_d_tiling.h", "op_kernel/tiling_key_fourier_transform2_d.h"]),
-    ("fused_prop_step", "6af2d5b76bd0f9be3759446c", "/root/work/mfg/fusedpropstep",
-     ["op_host/fused_prop_step.cpp", "op_kernel/fused_prop_step.cpp",
-      "op_kernel/fused_prop_step_tiling.h", "op_kernel/tiling_key_fused_prop_step.h"]),
-]
+PROBS = [(name, pid, zip_path("mfg", name)) for name, pid in MFG]
+
 
 def curl(args):
     p = subprocess.run(["curl", "-s", "-S", "-w", "\n__H__%{http_code}"] + args,
@@ -29,13 +27,13 @@ def curl(args):
         out = out[:m.start()]
     return code, out.strip()
 
-def submit(name, pid, root, rels):
-    files = []
-    for rel in rels:
-        p = os.path.join(root, rel)
-        if not os.path.exists(p):
-            print(f"{name}: MISSING {p}"); return None
-        files.append({"path": rel, "content": open(p, encoding="utf-8", errors="replace").read()})
+
+def submit(name, pid, zp):
+    if not os.path.exists(zp):
+        print(f"{name}: ZIP MISSING {zp}"); return None
+    with zipfile.ZipFile(zp) as z:
+        files = [{"path": n, "content": z.read(n).decode("utf-8", "replace")}
+                 for n in z.namelist() if not n.endswith("/")]
     payload = {"problemId": pid, "userId": USER_ID, "files": files}
     body = json.dumps(payload, ensure_ascii=False)
     tmp = f"/tmp/mfg_{name}.json"
@@ -61,6 +59,7 @@ def submit(name, pid, root, rels):
         print(f"{name}: ERR {code} {out[:200]}", flush=True); time.sleep(20)
     return None
 
+
 def poll(sid, tries=80, gap=20):
     for _ in range(tries):
         code, out = curl([f"{BASE}/submissions/{sid}?userId={USER_ID}",
@@ -72,12 +71,14 @@ def poll(sid, tries=80, gap=20):
         time.sleep(gap)
     return None
 
+
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("-")]
-    for name, pid, root, rels in PROBS:
-        if want and name not in want:
+    norm = {w.replace("_", "") for w in want}
+    for name, pid, zp in PROBS:
+        if want and name not in want and name.replace("_", "") not in norm:
             continue
-        sid = submit(name, pid, root, rels)
+        sid = submit(name, pid, zp)
         if not sid: continue
         print(f"{name}: polling...", flush=True)
         d = poll(sid)

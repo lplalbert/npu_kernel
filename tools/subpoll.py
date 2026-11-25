@@ -6,29 +6,32 @@
 """
 import os, sys, json, time, zipfile, urllib.request, urllib.error
 
-JWT = "<CANNJUDGE_JWT_REDACTED>"
-USER = "<MY_USER_ID>"
+JWT = os.environ.get("CANNJUDGE_JWT", "")
+USER = os.environ.get("CANNJUDGE_USER", "<MY_USER_ID>")
 BASE = "https://cannjudge.cn"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Content-Type": "application/json",
      "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 SIDS = "/tmp/ladder_sids.txt"
 
-MAP = {
-    "flashattention": ("6acef0f7e76989292713697f", "/root/work/ladder/fa_7files.zip"),
-    "convtranspose2d": ("6acef213e769892927149a50", "/root/work/ladder/ct2d_7files.zip"),
-    "gf2poly": ("6aec3c8d1dac5d235b9a3c50", "/root/work/ladder/gf2poly_7files.zip"),
-    "gf2k_mul_square": ("6aec3a341dac5d235b9509a4", "/root/work/ladder/gf2_7files.zip"),
-    "mhcsinkhorngrad": ("6acef064e76989292712c8e3", "/root/work/ladder/msg_7files.zip"),
-    "quantmatmulsigmoidmulquant": ("6acef084e76989292712e8ef", "/root/work/ladder/qmsq_7files.zip"),
-    "multiaddrmsnormdynamicquant": ("6acef047e76989292712aaae", "/root/work/ladder/marn_official_7files.zip"),
-    "confusionmulgrad": ("6acef021e769892927127ff1", "/root/work/ladder/cmg_7files.zip"),
-    "bit_plane_transform": ("6aec3d2e1dac5d235b9ba60d", "/root/work/ladder/bpt_7files.zip"),
-    "mseloss": ("6ad9c4a23ff2fef7e81cf6c6", "/root/work/ladder/mse_7files.zip"),
-    "group_norm": ("6ad9c2a83ff2fef7e81bf865", "/root/work/ladder/gn_7files.zip"),
-    "groupnormsiluquant": ("6ad9c36f3ff2fef7e81c55cc", "/root/work/ladder/gnsq_7files.zip"),
-    "index": ("6ad9c4023ff2fef7e81ca27e", "/root/work/ladder/index_7files.zip"),
-    "trace": ("6aceefd6e769892927123166", "/root/work/ladder/trace_7files.zip"),
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from probids import LADDER, MFG, S10, zip_path
+
+
+def resolve(name):
+    """名字去下划线匹配（旧短名 flashattention/confusionmulgrad 等也能命中）。"""
+    norm = name.replace("_", "")
+    hits = []
+    for kind, table in (("ladder", LADDER), ("mfg", MFG), ("s10", S10)):
+        for nm, pid, *_ in table:
+            if nm == name or nm.replace("_", "") == norm:
+                hits.append((kind, nm, pid))
+    if hits:
+        return hits
+    for kind, table in (("ladder", LADDER), ("mfg", MFG), ("s10", S10)):
+        for nm, pid, *_ in table:
+            if nm.startswith(name):
+                hits.append((kind, nm, pid))
+    return hits
 
 def req(path, data=None, method=None, timeout=180):
     body = json.dumps(data).encode() if data is not None else None
@@ -54,7 +57,13 @@ def detail(sid):
     return d
 
 def submit_one(name):
-    pid, zp = MAP[name]
+    hits = resolve(name)
+    if not hits:
+        print(f"{name}: unknown problem"); return None
+    if len(hits) > 1:
+        print(f"{name}: ambiguous -> " + ", ".join(f"{k}/{n}" for k, n, _ in hits)); return None
+    kind, nm, pid = hits[0]
+    zp = zip_path(kind, nm)
     if not os.path.exists(zp):
         print(f"{name}: ZIP MISSING {zp}"); return None
     with zipfile.ZipFile(zp) as z:

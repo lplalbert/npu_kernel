@@ -5,8 +5,8 @@
 """
 import os, sys, json, time, zipfile, urllib.request, urllib.error
 
-JWT = "<CANNJUDGE_JWT_REDACTED>"
-USER = "<MY_USER_ID>"
+JWT = os.environ.get("CANNJUDGE_JWT", "")
+USER = os.environ.get("CANNJUDGE_USER", "<MY_USER_ID>")
 BASE = "https://cannjudge.cn"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Content-Type": "application/json",
      "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
