@@ -44,7 +44,7 @@
 
 **别人接手时最需要的三件事，这里都有：**
 
-1. **能直接提交的产物** —— `*/zips/<op>_7files.zip` 就是判题平台要的 7 文件包（或 mfg 的 4 文件包），已校验「条目数 / 路径前缀 / 与源码 md5 一致 / 无违规标识符」。
+1. **能直接提交的产物** —— `*/zips/<op>_7files.zip` 就是判题平台要的 7 文件包（mfg 为 4 文件包），已校验「条目数 / 路径前缀 / 与源码 md5 一致 / 无违规标识符」。
 2. **源码** —— `*/<op>/op_host|op_kernel/` 下的可编辑文件，可直接改。
 3. **踩过的坑** —— `02_PITFALLS.md`（软硬件 + 判题机行为）和 `03_GOLDEN_ORDER.md`（**golden 归约顺序的逆向结论，这是本赛最贵的东西**）。
 
@@ -53,7 +53,7 @@
 ## 三、目录结构
 
 ```
-_handoff_repo/
+.
 ├── README.md                 ← 你在这里
 ├── 01_STATUS.md              ← 38 题完整成绩表（排名/得分/status/坏 case 数）
 ├── 02_PITFALLS.md            ← 硬件 & 判题机坑（必读）
@@ -65,14 +65,14 @@ _handoff_repo/
 ├── ladder/                   ← 天梯赛 18 个算子
 │   ├── <op>/op_host/*.cpp, op_kernel/*.h|*.cpp
 │   └── zips/<op>_7files.zip  ← 直接可提交
-├── mfg/                      ← 制造业赛 15 个算子（4 文件结构）
+├── mfg/                      ← 制造业赛 15 个算子
 │   ├── <op>/...
 │   └── zips/<op>_7files.zip
 ├── s10/                      ← S10 五个算子
 │   ├── <op>/...
 │   └── zips/<op>_7files.zip
 ├── tools/                    ← 提交 / 校验 / 诊断脚本
-└── docs/                     ← 赛题解析、作战手册、排行榜快照等原始资料
+└── docs/                     ← 赛题解析、作战手册、各题 NOTES、排行榜快照
 ```
 
 ---
@@ -105,7 +105,7 @@ python tools/verify_handoff.py   # 本包结构校验
 
 ## 五、必须知道的四件事（先读这几条，能省几天）
 
-1. **判据是 `相对误差 < 1e-4` **且** `绝对误差 < 1e-4`**（不是 numpy allclose 的 `atol+rtol·|b|` 或组合）。
+1. **判据是「相对误差 < 1e-4」** 且 **「绝对误差 < 1e-4」**（不是 numpy allclose 的 `atol+rtol·|b|` 或组合）。
    → 近零输出元素只要差 1 ulp 就会挂 → 高精度量化类算子基本只有**逐位复刻 golden** 才能过。
 
 2. **「提高精度」是错的，「复刻 golden 的归约顺序」才是对的。**
@@ -132,22 +132,25 @@ python tools/verify_handoff.py   # 本包结构校验
 
 本仓库为**公开**发布，因此已做以下处理：
 
-- 	ools/ 与 docs/ 中的 **CANNJudge JWT、开发机 SSH 密码 / hostkey / 内网 IP** 已全部替换为占位符
-  （<CANNJUDGE_JWT_REDACTED> / <SSH_PASSWORD_REDACTED> 等），**运行脚本前请按 	ools/CREDENTIALS.md 填回**。
-- 提交产物 zip（*/zips/*.zip）与源码不含任何凭据，可直接使用。
+- `tools/` 与 `docs/` 中的 **CANNJudge JWT、开发机 SSH 密码 / hostkey / 内网 IP** 已全部替换为占位符
+  （`<CANNJUDGE_JWT_REDACTED>` / `<SSH_PASSWORD_REDACTED>` 等），**运行脚本前请按 `tools/CREDENTIALS.md` 填回**。
+- 提交产物 zip（`*/zips/*.zip`）与源码不含任何凭据，可直接使用。
+
+---
 
 ## 八、目录里各 zip 是什么
 
-ladder/zips/<op>_7files.zip 就是判题平台「打包上传工程」要的东西：
-7 个条目，路径形如 op_host/<base>_def.cpp、op_kernel/<base>.h，**无工程名前缀**。
-mfg 是 4 个条目（op_host/<base>.cpp + op_kernel/<base>.cpp + _tiling.h + 	iling_key_<base>.h）。
+`ladder/zips/<op>_7files.zip` 就是判题平台「打包上传工程」要的东西：
+7 个条目，路径形如 `op_host/<base>_def.cpp`、`op_kernel/<base>.h`，**无工程名前缀**。
 
-自检：python tools/verify_handoff.py（校验条目数 / md5 / 违规标识符）。
+mfg 通常是 4 个条目：`op_host/<base>.cpp` + `op_kernel/<base>.cpp` + `op_kernel/<base>_tiling.h` + `op_kernel/tiling_key_<base>.h`。
+
+自检：`python tools/verify_handoff.py`（校验条目数 / md5 / 违规标识符）。
 
 ---
 
 ## 九、关于 4 个 mfg 算子的 3 文件包
 
-andom_walk / cylinder_query / spmm_sum / segment_min_csr 这 4 道**本来就没有 	iling_key_<base>.h**
-（单 tiling key，无需模板参数），因此它们的 zip 是 **3 个条目**，这是它们当年提交时的真实形态，不是缺失。
+`random_walk` / `cylinder_query` / `spmm_sum` / `segment_min_csr` 这 4 道**本来就没有** `tiling_key_<base>.h`
+（单 tiling key，无需模板参数），因此它们的 zip 是 **3 个条目** —— 这是它们当年提交时的真实形态，不是缺失。
 其余 mfg 算子为 4 个条目。
