@@ -98,7 +98,7 @@ python tools/verify_handoff.py   # 本包结构校验
 ```
 
 **远端开发机**（原环境，CANN 9.2 / 910B2）：
-`plink -ssh -P 40012 -pw <pw> root@223.92.35.239`，工程在 `/root/work/ladder/<op>`、`/root/work/mfg/<op>`。
+`plink -ssh -P 40012 -pw <pw> root@<DEV_HOST>`，工程在 `/root/work/ladder/<op>`、`/root/work/mfg/<op>`。
 > 注意：交接时该机 SSH 端口（40012）已拒连，若需重连请先确认端口转发是否恢复。
 
 ---
@@ -123,5 +123,23 @@ python tools/verify_handoff.py   # 本包结构校验
 ## 六、交接时需要向用户确认的事
 
 - CANNJudge 的 JWT / userId 是否仍有效（本包 `tools/` 里写死的是 2026-11-25 的快照，`exp` 到 2026-11-26 前后，**很可能已过期，需要重新登录取 Cookie**）。
-- 原开发机 `223.92.35.239:40012` 的端口转发是否需要重新开通。
+- 原开发机 `<DEV_HOST>:40012` 的端口转发是否需要重新开通。
 - 天梯赛是 **`best` 模式计分**（取历史最优），所以反复提交 A/B 不会掉分；mfg / S10 请自行确认计分口径。
+
+---
+
+## 七、公开仓库说明
+
+本仓库为**公开**发布，因此已做以下处理：
+
+- 	ools/ 与 docs/ 中的 **CANNJudge JWT、开发机 SSH 密码 / hostkey / 内网 IP** 已全部替换为占位符
+  （<CANNJUDGE_JWT_REDACTED> / <SSH_PASSWORD_REDACTED> 等），**运行脚本前请按 	ools/CREDENTIALS.md 填回**。
+- 提交产物 zip（*/zips/*.zip）与源码不含任何凭据，可直接使用。
+
+## 八、目录里各 zip 是什么
+
+ladder/zips/<op>_7files.zip 就是判题平台「打包上传工程」要的东西：
+7 个条目，路径形如 op_host/<base>_def.cpp、op_kernel/<base>.h，**无工程名前缀**。
+mfg 是 4 个条目（op_host/<base>.cpp + op_kernel/<base>.cpp + _tiling.h + 	iling_key_<base>.h）。
+
+自检：python tools/verify_handoff.py（校验条目数 / md5 / 违规标识符）。

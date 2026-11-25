@@ -3,7 +3,7 @@
 """轮询已提交的 submissionId，打印 status / precision / 各 case。"""
 import json, urllib.request, urllib.error, sys, time
 
-JWT = "<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>"
+JWT = "<CANNJUDGE_JWT_REDACTED>"
 USER = "<MY_USER_ID>"
 BASE = "https://cannjudge.cn"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Accept": "application/json", "User-Agent": "Mozilla/5.0"}

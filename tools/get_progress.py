@@ -3,7 +3,7 @@
 """按 problemId 查我们每个题的最新提交（替代 sids 记录）。"""
 import json, urllib.request, urllib.error
 
-JWT = "<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>"
+JWT = "<CANNJUDGE_JWT_REDACTED>"
 USER = "<MY_USER_ID>"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Accept": "application/json",
      "User-Agent": "Mozilla/5.0"}

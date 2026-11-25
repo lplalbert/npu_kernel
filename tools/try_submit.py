@@ -5,7 +5,7 @@
 """
 import os, sys, json, zipfile, time, urllib.request, urllib.error
 
-JWT = "<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>"
+JWT = "<CANNJUDGE_JWT_REDACTED>"
 USER = "<MY_USER_ID>"
 BASE = "https://cannjudge.cn"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Content-Type": "application/json",

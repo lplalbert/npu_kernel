@@ -71,7 +71,7 @@ curl -s "https://cannjudge.cn/api/submissions/<id>?userId=<MY_USER_ID>" \
   --proxy http://127.0.0.1:7892 -H "Cookie: cannjudge_auth=<JWT>"
 ```
 
-- **JWT**（cannjudge_auth cookie 值）：`<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>` —— **有效期至 2026-11-29**，过期让用户在浏览器 DevTools→Application→Cookies→cannjudge.cn 里重取
+- **JWT**（cannjudge_auth cookie 值）：`<CANNJUDGE_JWT_REDACTED>` —— **有效期至 2026-11-29**，过期让用户在浏览器 DevTools→Application→Cookies→cannjudge.cn 里重取
 - editable 7 件套：`op_kernel/{mish.cpp,mish.h,mish_tiling_data.h,mish_tiling_key.h}` + `op_host/{mish_def.cpp,mish_infershape.cpp,mish_tiling.cpp}`（换题同构，文件名随算子名变）
 - 判题结果字段：`status`（Pass / Time Limit Exceeded / …）、`result[]` 每例 `testcase_status`（Pass/Hidden）、`time`、`precision_ratio`（要 1.0）、`best_time`（榜首参考）；**Hidden 用例 45 个不外显细节，但决定最终 status**
 - 提交额度 10 次/天；每次判题约 8~12 分钟；题目列表/题面拉法见 `memory/s10-mish-campaign.md`

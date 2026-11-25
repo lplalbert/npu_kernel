@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """打印某次提交的完整 result（含每个 case 的 msg / blockdim 等字段）。"""
 import json, sys, urllib.request
-JWT = "<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>"
+JWT = "<CANNJUDGE_JWT_REDACTED>"
 USER = "<MY_USER_ID>"
 H = {"Cookie": f"cannjudge_auth={JWT}", "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 sid = sys.argv[1]

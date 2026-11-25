@@ -10,7 +10,7 @@
 """
 import sys, os, json, time, zipfile, urllib.request, urllib.error, argparse
 
-JWT = "<CANNJUDGE_JWT_REDACTED>.<CANNJUDGE_JWT_REDACTED>"
+JWT = "<CANNJUDGE_JWT_REDACTED>"
 USER = "<MY_USER_ID>"
 BASE = "https://cannjudge.cn"
 CONTEST = "6aced8d2e769892927fdb17f"
