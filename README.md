@@ -143,3 +143,11 @@ ladder/zips/<op>_7files.zip 就是判题平台「打包上传工程」要的东�
 mfg 是 4 个条目（op_host/<base>.cpp + op_kernel/<base>.cpp + _tiling.h + 	iling_key_<base>.h）。
 
 自检：python tools/verify_handoff.py（校验条目数 / md5 / 违规标识符）。
+
+---
+
+## 九、关于 4 个 mfg 算子的 3 文件包
+
+andom_walk / cylinder_query / spmm_sum / segment_min_csr 这 4 道**本来就没有 	iling_key_<base>.h**
+（单 tiling key，无需模板参数），因此它们的 zip 是 **3 个条目**，这是它们当年提交时的真实形态，不是缺失。
+其余 mfg 算子为 4 个条目。

@@ -390,6 +390,202 @@
     "note": ""
   },
   {
+    "kind": "mfg",
+    "op": "complex_exp",
+    "base": "complex_exp",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\complexexp__v2",
+    "layout": "project",
+    "files": [
+      "op_host/complex_exp.cpp",
+      "op_kernel/complex_exp.cpp",
+      "op_kernel/complex_exp_tiling.h",
+      "op_kernel/tiling_key_complex_exp.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\complex_exp_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "random_walk",
+    "base": "random_walk",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\randomwalk",
+    "layout": "project",
+    "files": [
+      "op_host/random_walk.cpp",
+      "op_kernel/random_walk.cpp",
+      "op_kernel/random_walk_tiling.h"
+    ],
+    "missing": [
+      "op_kernel/tiling_key_random_walk.h"
+    ],
+    "zip": "mfg\\zips\\random_walk_7files.zip",
+    "note": "部分文件缺失（该算子实际无需）"
+  },
+  {
+    "kind": "mfg",
+    "op": "gather_coo",
+    "base": "gather_coo",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\gathercoo",
+    "layout": "project",
+    "files": [
+      "op_host/gather_coo.cpp",
+      "op_kernel/gather_coo.cpp",
+      "op_kernel/gather_coo_tiling.h",
+      "op_kernel/tiling_key_gather_coo.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\gather_coo_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "complex_abs",
+    "base": "complex_abs",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\complexabs",
+    "layout": "project",
+    "files": [
+      "op_host/complex_abs.cpp",
+      "op_kernel/complex_abs.cpp",
+      "op_kernel/complex_abs_tiling.h",
+      "op_kernel/tiling_key_complex_abs.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\complex_abs_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "grid_cluster",
+    "base": "grid_cluster",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\gridcluster",
+    "layout": "project",
+    "files": [
+      "op_host/grid_cluster.cpp",
+      "op_kernel/grid_cluster.cpp",
+      "op_kernel/grid_cluster_tiling.h",
+      "op_kernel/tiling_key_grid_cluster.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\grid_cluster_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "complex_div",
+    "base": "complex_div",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\complexdiv",
+    "layout": "project",
+    "files": [
+      "op_host/complex_div.cpp",
+      "op_kernel/complex_div.cpp",
+      "op_kernel/complex_div_tiling.h",
+      "op_kernel/tiling_key_complex_div.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\complex_div_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "cylinder_query",
+    "base": "cylinder_query",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\cylinderquery",
+    "layout": "project",
+    "files": [
+      "op_host/cylinder_query.cpp",
+      "op_kernel/cylinder_query.cpp",
+      "op_kernel/cylinder_query_tiling.h"
+    ],
+    "missing": [
+      "op_kernel/tiling_key_cylinder_query.h"
+    ],
+    "zip": "mfg\\zips\\cylinder_query_7files.zip",
+    "note": "部分文件缺失（该算子实际无需）"
+  },
+  {
+    "kind": "mfg",
+    "op": "ball_query",
+    "base": "ball_query",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\ballquery",
+    "layout": "project",
+    "files": [
+      "op_host/ball_query.cpp",
+      "op_kernel/ball_query.cpp",
+      "op_kernel/ball_query_tiling.h",
+      "op_kernel/tiling_key_ball_query.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\ball_query_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "furthest_point_sample",
+    "base": "furthest_point_sample",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\furthestpointsample",
+    "layout": "project",
+    "files": [
+      "op_host/furthest_point_sample.cpp",
+      "op_kernel/furthest_point_sample.cpp",
+      "op_kernel/furthest_point_sample_tiling.h",
+      "op_kernel/tiling_key_furthest_point_sample.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\furthest_point_sample_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "spmm_sum",
+    "base": "spmm_sum",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\spmmsum",
+    "layout": "project",
+    "files": [
+      "op_host/spmm_sum.cpp",
+      "op_kernel/spmm_sum.cpp",
+      "op_kernel/spmm_sum_tiling.h"
+    ],
+    "missing": [
+      "op_kernel/tiling_key_spmm_sum.h"
+    ],
+    "zip": "mfg\\zips\\spmm_sum_7files.zip",
+    "note": "部分文件缺失（该算子实际无需）"
+  },
+  {
+    "kind": "mfg",
+    "op": "segment_min_csr",
+    "base": "segment_min_csr",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\segmentmincsr",
+    "layout": "project",
+    "files": [
+      "op_host/segment_min_csr.cpp",
+      "op_kernel/segment_min_csr.cpp",
+      "op_kernel/segment_min_csr_tiling.h"
+    ],
+    "missing": [
+      "op_kernel/tiling_key_segment_min_csr.h"
+    ],
+    "zip": "mfg\\zips\\segment_min_csr_7files.zip",
+    "note": "部分文件缺失（该算子实际无需）"
+  },
+  {
+    "kind": "mfg",
+    "op": "radius",
+    "base": "radius",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\radius",
+    "layout": "project",
+    "files": [
+      "op_host/radius.cpp",
+      "op_kernel/radius.cpp",
+      "op_kernel/radius_tiling.h",
+      "op_kernel/tiling_key_radius.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\radius_7files.zip",
+    "note": ""
+  },
+  {
     "kind": "s10",
     "op": "mish",
     "base": "mish",

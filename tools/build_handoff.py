@@ -45,6 +45,19 @@ MFG = [
      {"extra": {"op_kernel/tiling_key_fourier_transform2_d.h":
                 r"_sec5_build\ascend_tasks\mfg_work\remote\fft2d\op_kernel\tiling_key_fourier_transform2_d.h"}}),
     ("fused_prop_step", "fused_prop_step", r"mfg_fps", "flat_mfg", {}),
+    # 以下为历史已 Pass 的算子（部分无 tiling_key，按实际存在的文件打包，partial=True）
+    ("complex_exp", "complex_exp", r"_sec5_build\ascend_tasks\mfg_work\complexexp__v2", "project", {"partial": True}),
+    ("random_walk", "random_walk", r"_sec5_build\ascend_tasks\mfg_work\randomwalk", "project", {"partial": True}),
+    ("gather_coo", "gather_coo", r"_sec5_build\ascend_tasks\mfg_work\gathercoo", "project", {"partial": True}),
+    ("complex_abs", "complex_abs", r"_sec5_build\ascend_tasks\mfg_work\complexabs", "project", {"partial": True}),
+    ("grid_cluster", "grid_cluster", r"_sec5_build\ascend_tasks\mfg_work\gridcluster", "project", {"partial": True}),
+    ("complex_div", "complex_div", r"_sec5_build\ascend_tasks\mfg_work\complexdiv", "project", {"partial": True}),
+    ("cylinder_query", "cylinder_query", r"_sec5_build\ascend_tasks\mfg_work\cylinderquery", "project", {"partial": True}),
+    ("ball_query", "ball_query", r"_sec5_build\ascend_tasks\mfg_work\ballquery", "project", {"partial": True}),
+    ("furthest_point_sample", "furthest_point_sample", r"_sec5_build\ascend_tasks\mfg_work\furthestpointsample", "project", {"partial": True}),
+    ("spmm_sum", "spmm_sum", r"_sec5_build\ascend_tasks\mfg_work\spmmsum", "project", {"partial": True}),
+    ("segment_min_csr", "segment_min_csr", r"_sec5_build\ascend_tasks\mfg_work\segmentmincsr", "project", {"partial": True}),
+    ("radius", "radius", r"_sec5_build\ascend_tasks\mfg_work\radius", "project", {"partial": True}),
 ]
 
 S10 = [
@@ -163,7 +176,7 @@ def emit(kind, op, base, src, layout, opts, manifest):
         staged.append((rel, dst))
 
     entry["missing"] = missing
-    if not missing and staged:
+    if staged and (not missing or opts.get("partial")):
         zpath = os.path.join(zips_dir, op + "_7files.zip")
         if os.path.exists(zpath):
             os.remove(zpath)
@@ -171,15 +184,20 @@ def emit(kind, op, base, src, layout, opts, manifest):
             for rel, dst in staged:
                 z.write(dst, arcname=rel)
         entry["zip"] = os.path.relpath(zpath, REPO)
+        if missing:
+            entry["note"] = (entry["note"] + "; " if entry["note"] else "") + "部分文件缺失（该算子实际无需）"
     manifest.append(entry)
     return entry
 
 
 def main():
-    if os.path.isdir(REPO):
-        shutil.rmtree(REPO)
+    # 只清理内容子目录，保留 .git（版本历史）与根目录 md
     for sub in ("ladder", "mfg", "s10", "tools", "docs"):
-        os.makedirs(os.path.join(REPO, sub), exist_ok=True)
+        p = os.path.join(REPO, sub)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        os.makedirs(p, exist_ok=True)
+    os.makedirs(REPO, exist_ok=True)
 
     manifest = []
     for t in LADDER:
