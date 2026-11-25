@@ -1,0 +1,145 @@
+https://gitcode.com/cann
+CANN 算子天梯赛
+6月赛题评析与7月赛题解析
+作者：张鑫/胡邵娟
+时间：2026/07/21目录
+Part 1 天梯赛6月冠军代码解析
+Part 2 天梯赛7月赛题思路解析
+https://gitcode.com/cannC A N N 算子天梯赛
+报名链接：https://competition.gitcode.com/competition/2057085957316272129/introC A N N 算子天梯赛6 月算子题目答题情况
+答题情况概览
+算子 类型 难度系数 尝试人数 通过人数 月度冠军奖品
+Celu vector 1 53 28 HUAWEI MatePad 11.5 柔光版 WIFI 8
+Selu vector 1 31 20 HUAWEI MatePad 11.5 柔光版 WIFI 8
+HardSwish vector 1 28 19 HUAWEI MatePad 11.5 柔光版 WIFI 8
+QuantBatchMatmulV3的K-C
+量化场景末维上限约束消除
+cube 4 23 9 HUAWEI Mate80ProMax 16GB+512GB 极
+昼金 双卡 全网通版
+QuantBatchMatmulV3的K-C
+量化场景性能优化
+cube 4 60 31 HUAWEI Mate80ProMax 16GB+512GB 极
+昼金 双卡 全网通版
+Conv2D cube 4 28 1 HUAWEI Mate80ProMax 16GB+512GB 极
+昼金 双卡 全网通版
+奖品展示
+C A N N 算子天梯赛6 月冠军代码解析
+6月冠军实现解析：
+① 使用for循环遍历，实现单点的卷积乘累加操作
+② 针对case规格进行了分支处理，后续考虑泛化性
+下一步性能优化思路解析：
+① 使用Cube核和支持指令完成Conv，VCV组合实现
+② 利用Img2Col和SIMD指令，高效完成乘累加
+③ 考虑vec与Cube间数据依赖，通过Tiling和kernel配合，实
+现CV并行能力
+④参考资料：
+https://www.hiascend.com/document/detail/zh/canncommercial/latest/A
+PI/ascendcopapi/atlasascendc_api_07_0249.html
+Conv2D
+6月冠军实现解析：
+① 使用vec cube串行实现：C核→ GetTensorC(L0C→GM) 
+→ V核累加 → 下一K块C核 → … → 最终V核量化输出
+② AIC-AIV串行：MAC利用率8%
+③ tiling策略层面：硬编码baseM= singleCoreM = 7，可
+考虑进一步调整tiling策略
+下一步性能优化思路解析：
+① 优化流水排布：使用cv并行实现
+② 调整tiling策略：针对shape约束范围内泛化策略
+③ 尝试K轴错峰加载缓解bank冲突
+④ 尝试MTE2 preload优化数据搬运流水
+QuantBatchMatmulV3的K-C
+量化场景末维上限约束消除
+6月冠军实现解析：
+① 开Double Buffer
+② 均匀分块
+③ 自适应分核
+④ 计算方式优化
+⑤ 其中Hardwish是面向case编程，每个case优
+化基本到上限，其他泛化场景未处理
+3个elementwise算子实现分支细致，基本已经
+达到极限
+Celu/Selu/HardSwish
+新增赛制约束：
+① 跨月赛题当月性能最佳提交且超过历史最佳性能3%以上成为月度冠军获
+奖，计算方式为所有测试用例耗时总和提升比例大于3%。
+② 要求具备泛化性，满足赛题中的范围，禁止针对用例白盒编程。
+③ 每月封榜后会对算子进行泛化性验收测试，通过验收才奖励。
+④ 每月单人最多获奖三道赛题，优先奖金级别最高的三道题。
+优化思路参考：
+① 开源算子仓：
+https://gitcode.com/cann/ops-math，https://gitcode.com/cann/ops-cv，
+https://gitcode.com/cann/ops-nn，https://gitcode.com/cann/ops-transformer
+② samples样例仓： https://gitcode.com/cann/cann-samples
+③ CANN微信公众号：微信扫描右侧二维码
+C A N N 算子天梯赛7 月算子题目解读
+赛题概览
+算子 类型 难度系数 难点 月度冠军奖品
+causal_conv1d_update vector 2 Tiling分核、负载均衡 4000元等值奖品
+confusion_matrix vector 3 Tiling分核、负载均衡、数据搬运 6000元等值奖品
+inplace_update vector 3 数据搬运，DoubleBuffer 6000元等值奖品
+recompute_w_u fusion 2 Matmul API，CV同步、流水排布 4000元等值奖品
+chunk_scaled_dot_kkt fusion 3 Matmul API，CV同步、流水排布 6000元等值奖品
+chunk_gated_delta_rule_fwd_h fusion 5 Matmul API，CV同步、流水排布、负载均衡 10000元等值奖品C A N N 算子天梯赛7 月算子题目解读
+算子功能描述：
+对序列执行因果一维卷积，沿序列维度使用缓存数据（长度为卷积核
+宽减1）对各序列头部进行padding，确保输出依赖当前及历史输入
+对每个dim，每个时间步t，执行以下计算：
+𝑦(𝑡, 𝑑𝑖𝑚) = ෍
+𝑗=0
+K−1
+𝑤𝑒𝑖𝑔ℎ𝑡(𝑡, 𝑑𝑖𝑚) · 𝑥′ 𝑡 − 𝑗, 𝑑𝑖𝑚
+𝐾 = 𝑤𝑒𝑖𝑔ℎ𝑡 卷积核宽度，通常为 2/3/4
+𝑥′为扩展后输入：当 𝑡 − 𝑗 < 0 时，从conv_state 读取历史；若无历史
+则为 0
+可选融合算子SiLu
+causal_conv1d_update
+优化策略：
+① decode阶段使用，序列长度较小，优先使用dim进行分核，负载均
+衡
+② 减少重复数据搬运，优化MTE2
+注意：
+① 当前序列计算完后，conv_state需要原地更新，用于下一个序列的
+计算
+② 支持MTP时，cache_state的计算需要用到num_accepted_tokens
+参考资料：
+① A5实现： https://gitcode.com/cann/ops-
+transformer/tree/master/attention/fused_causal_conv1d
+② triton实现：https://github.com/vllm-project/vllm-
+ascend/blob/main/vllm_ascend/ops/triton/mamba/causal_conv
+1d.py
+chunk_gated_delta_rule_fwdh
+优化策略：
+① Tiling方式：chunk之前有依赖，只能通过h * batch进行切分
+② 考虑在变长序列场景下，不同的batch，序列长度不同，注意核间负载
+均衡
+③ CV并行，充分考虑CV依赖，优化流水排布
+④ CV核间优先使用硬同步，Matmul低阶API使用
+注意：
+① shape的转置
+参考资料：
+① 融合算子实现： https://gitcode.com/cann/ops-
+transformer/tree/master/attention/chunk_gated_delta_rule
+② Matmul API使用： https://gitcode.com/cann/asc-
+devkit/blob/master/examples/01_simd_cpp_api/04_advanced_api/00_mat
+mul/README.md
+https://gitcode.com/cann/asc-
+devkit/blob/master/examples/01_simd_cpp_api/03_basic_api/03_matrix_c
+ompute/README.md
+算子功能描述：
+线性注意力的GDN模块中的一个部分，主要是在前向传播阶段，沿着
+序列块（chunk）推进隐状态（hidden state），结合门控衰减g和 
+delta 规则，完成 每一个chunk ℎ𝑡 + 1的计算，输出前向递推的最终状 态。
+每个chunk计算过程：
+C1:  𝑤 @ ℎ𝑡
+V1:  𝑣𝑛𝑒𝑤 = 𝑢 − 𝑤 @ ℎ𝑡, 𝑣𝑛𝑒𝑤_𝑑𝑒𝑐𝑎𝑦 = 𝑣𝑛𝑒𝑤 · 𝑒𝑥𝑝(𝑔𝑙𝑎𝑠𝑡 − 𝑔) C2:  ℎ𝑡 ′ = 𝑘𝑇 @ 𝑣𝑛𝑒𝑤_𝑑𝑒𝑐𝑎𝑦
+V2:  ℎ𝑡 + 1 = ℎ𝑡 · 𝑒𝑥𝑝 𝑔𝑙𝑎𝑠𝑡 + ℎ𝑡′Thank you.
+社区愿景：打造开放易用、技术领先的AI算力新生态
+社区使命：使能开发者基于CANN社区自主研究创新，构筑根深叶茂、
+跨产业协同共享共赢的CANN生态
+Vision: Building an Open, Easy-to-Use, and Technology-leading AI Computing 
+Ecosystem
+Mission: Enable developers to independently research and innovate based on 
+the CANN community and build a win-win CANN ecosystem with deep roots and 
+cross-industry collaboration and sharing.
+上CANN社区获取干货 关注CANN公众号获取资讯
+https://gitcode.com/cann

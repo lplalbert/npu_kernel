@@ -1,0 +1,356 @@
+https://gitcode.com/cann
+CANN 挑战赛赛题解析
+作者：宋恺    分享嘉宾：田起光、陈思、陈书剑
+时间：2026年9月目录
+Part 1 赛事介绍
+Part 2 赛题解读
+https://gitcode.com/cannhttps://gitcode.com/cann
+CANN
+是什么
+全面支持业界AI框架，适配PyTorch社区版本AI框架
+昇腾硬件
+MindStudio
+全流程工具链
+调试调优
+模型量化
+…
+驱动    板级驱动 | 加速器驱动 | 设备管理
+运行时 执行控制 | 内存管理 | 任务调度
+毕昇编译器 异构编译优化 | 指令亲和 | 支持三方编程语言
+算子编程 C/C++ | Python
+算子库
+大模型融合算子、神经
+网络及数学类基础算子
+通信库
+集合通信算法
+分布式通信
+领域加速库
+信号处理等特定领域
+计算加速
+图引擎
+图编译优化
+图执行加速
+异构计算架构
+应用使能 Mind系列应用使能
+MindIE | MindSpeed | MindCluster | MindSDK | MindEdge
+...
+三方应用使能
+veRL | AReaL | vLLM | SGLang | …
+集群
+ 服务器
+ 标卡
+ 小站
+ 模组 ...
+CANN（Compute Architecture for Neural Networks）是华为针对AI场景推出的异构计算架构，对上支持
+多种AI框架，对下服务AI处理器与编程，发挥承上启下的关键作用，是提升昇腾AI处理器计算效率的关键平台。https://gitcode.com/cann
+大赛简介及日程
+CANN挑战赛是由 CANN开源社区 主办的赛事。大赛依托华为算法挑战赛，围绕昇腾AI算子开发、功能实现与性
+能优化设置竞赛任务，并提供配套学习资料和在线实践环境，帮助参赛选手了解算子开发流程，提升编程实践和性能优化
+能力。本届赛事设置 杭厦、上合、京津东北、西北、西南五大赛区，面向全国相关区域高校学生开放报名。欢迎高校学
+子参与挑战。
+7/21 9/5 10/17
+（周六）
+10/18 10/19 10/20 11/6 11/7
+(公示) (公布)
+赛题发布，启动初赛 赛题发布 现场决赛&颁奖报名截止 线上初赛截止启动报名
+在线答题 在线答题
+（周六）
+前32强队伍晋级复赛 现场决出一等奖、二等奖、三等奖
+初赛 决赛
+10/16
+一等奖、二等奖获奖队伍邀请参与 12月5日 的全国总决赛
+注：各个赛区时间以赛事卡片、社区通知为准。https://gitcode.com/cann
+赛事规则
+参赛对象：
+高校在校学生。
+参赛要求：
+参赛选手需要根据赛题赛规要求，在指定时间内完
+成报名、赛区选择、组队、作品提交，方为有效参
+赛。报名资料提交后将无法修改。每支队伍仅允许
+队长申请算力资源，申请算力资源后不能更换团队
+名称、队伍成员，请参赛者注意在申请算力资源前
+完成队伍组建。
+组队要求：
+先报名后组队，每支队伍1-3人，要求队伍成员在
+同一赛区（同一赛区不同学校可跨学校组队，不
+同赛区不可跨赛区组队）；报名后选手需要在PC
+端登录大赛官网并进入赛区页面组队。
+比赛规则：
+• 区域比赛分两个阶段：线上初赛和线下决赛，
+每个阶段都需要参赛队伍至少提交一次作品，才能准
+确计算有效成绩。大赛将选取各参赛队伍正式赛中的
+最后提交的成绩，作为本团队最终成绩进行排名，请
+各位选手做好版本管理。
+公平参赛：
+每个阶段比赛结束后大赛组委会将进行代码查验，如
+发现代码重复或违规等情况，将取消该队伍参赛资格
+和现有成绩。
+1.
+2.
+3.
+4.
+5.https://gitcode.com/cann
+2026
+赛区介绍
+六大赛区
+京津东北赛区
+杭厦赛区
+西北赛区
+西南赛区
+京津东北（北研所）：北京、天津、黑龙江、吉林、辽宁、河北、内蒙古
+杭厦赛区（杭研所）：浙江、福建、江西
+西北（西研所）：陕西、甘肃、河南、山西、新疆、青海、宁夏
+西南（成研所）：四川、重庆、云南、贵州
+中国籍留学生
+（居住地所在赛区参赛）
+国内学生：选按照学校所在城市选择对应赛区报名，赛区内可多校
+学生组队参加，每队人数1~3人
+海外中国籍留学生：需按照国内居住地所在城市选择对应赛区报名
+江山赛区 江山（南研所）：江苏、山东
+上合赛区 上合赛区（上研所）：上海、安徽
+已结束
+比赛地点：初赛线上、决赛分布在6个研究所。奖项设置
+— 决赛（每个赛区） — — 初赛 —
+每个赛区初赛前 32 强团队获得
+免机考；
+免机考和一轮专业面试。
+https://gitcode.com/cann
+报名方式
+10月16日23:59截止
+扫码报名参赛 官方交流入口（内置5个赛区QQ群）
+目录
+Part 2 赛题解读
+Part 1 赛事介绍
+https://gitcode.com/cann赛题应用
+-
+申请算力、答题步骤介绍赛题解读
+-
+判题过程与得分介绍
+判题过程介绍
+➢ 平台会自动跳转到提交界面，后台Case验证完成后返回结果。
+得分规则
+➢ 提交完成后可查看提交排名。
+➢ 本次比赛共15个测试点，所有case点精度全部通过才会计分。
+➢ 每个测试点单独计分，逻辑如下（T为最优性能，t为当前提交性能）：
+➢ 排行榜显示的最终分数为所有case得分的均值。若得分计算一致，则以
+提交时间进行排序，提交越早，排名越高。
+注意：编译错误可在执行结果界面查看具体报错
+➢ 完成赛题要求的一个文件并点击提交代码。
+注意：排行榜仅针对最后一次提交呈现，请确保比赛结束前提交的是最优实现
+https://gitcode.com/cann
+京津东北赛题解读
+-
+赛题背景
+■ 赛题背景：
+① 旋转位置编码（Rotary Position Embedding，RoPE）是现代大语言模型注入位置信息
+的核心机制，被 Llama、Qwen、DeepSeek、GLM 等主流模型广泛采用。RoPE 将 token 
+向量的维度两两配对为二维平面上的点，按"频率 × 位置"的角度对每对维度做旋转，在不
+引入可学习参数的前提下编码相对位置关系。公式为：
+𝑖𝑛𝑣_𝑓𝑟𝑒𝑞[𝑖] = 𝜃−2𝑖/𝑑, 𝜃𝑖 = 𝑝 ⋅ 𝑖𝑛𝑣_𝑓𝑟𝑒𝑞[𝑖]
+𝑦𝑖 = 𝑥𝑖𝑐𝑜𝑠𝜃𝑖 − 𝑥𝑖+𝑑/2𝑠𝑖𝑛𝜃𝑖, 𝑦𝑖+𝑑/2 = 𝑥𝑖+𝑑/2𝑐𝑜𝑠𝜃𝑖 + 𝑥𝑖𝑠𝑖𝑛𝜃𝑖
+■ 赛题特点
+① 本次比赛要求使用Ascend C编程语言完成RotaryPosEmb算子开发
+② 在满足精度的基础上，比拼算子性能京津东北赛题解读
+-
+题目概述：
+RotaryPosEmb
+算子开发
+■ 题目概述：
+实现的RotaryPosEmb算子需对输入张量执行旋转位置编码计算，计算公式为：y = RoPE(x, positions; theta)。算子由若干小算子逻辑拼接完成，输入输出要求
+如下：
+类型 参数名 类型 维度形状 支持数据类型 数据格式 备注
+INPUT（必选） x tensor (B, S, H, rope_dim) float16, float32 ND 待旋转的rope子维度张量
+INPUT（必选） positions tensor (B, S) int32 ND 每个token的位置索引
+ATTR（属性） theta float - - - RoPE基础频率基数，默认10000.0
+OUTPUT（输出） y tensor 与x一致 与x一致 与x一致 旋转位置编码后的输出
+■ 算子功能分解（小算子拼接）：
+① 逆频率计算
+arange / pow / div →
+② 旋转角与cos/sin生成
+mul / cos / sin（FP32） →
+③ 维度配对旋转
+rotate-half / mul / add →
+④ 输出 y
+形状、数据类型与x一致
+■ 约束说明：
+芯片类型：Atlas A2（910B）
+维度范围：固定4维输入（B, S, H, rope_dim）；B∈[1,128]，S∈[1,8192]，H∈[1,256]，rope_dim∈[16,1024]且必须为偶数
+张量大小：内存范围内的任意大小，因芯片UB大小的约束需进行切分，支持大数据量的计算；非对齐组合需正确处理
+中间精度要求：逆频率与cos/sin计算必须使用FP32精度，避免长序列下角度误差累积https://gitcode.com/cann
+西北赛题解读
+-
+赛题背景
+■ 赛题背景：
+① Mixture-of-Experts（MoE）是当前大语言模型的主流扩展架构，模型由大量专家子网
+络构成，每个token在推理时只激活其中少量专家，从而在保持大参数量容量的同时控制推
+理成本。MoE路由（gating）是决定每个token激活哪些专家的关键算子，DeepSeek V4
+采用 sqrt(softplus(logits)) 作为专家评分函数，为每个token选出top-k个专家。公式为：
+𝑠𝑐𝑜𝑟𝑒[𝑡, 𝑒] = 𝑠𝑜𝑓𝑡𝑝𝑙𝑢𝑠(𝑥[𝑡, 𝑒]) = 𝑙𝑛(1 + 𝑒𝑥[𝑡,𝑒])
+𝑠𝑐𝑜𝑟𝑒𝑠_𝑜𝑢𝑡[𝑡, 𝑗] = 𝑠𝑐𝑜𝑟𝑒[𝑡, 𝑖𝑑𝑠[𝑡, 𝑗]], 𝑖𝑑𝑠 = 𝑡𝑜𝑝 − 𝑘(𝑠𝑐𝑜𝑟𝑒)
+■ 赛题特点
+① 本次比赛要求使用Ascend C编程语言完成SqrtSoftplusTopK算子开发
+② 在满足精度的基础上，比拼算子性能西北赛题解读
+-
+题目概述：
+SqrtSoftplusTopK
+算子开发
+■ 题目概述：
+实现的SqrtSoftplusTopK算子需对路由logits逐元素计算sqrt(softplus(x))评分，并依据评分为每个token选出top-k个专家，输出选中专家的评分（不输出专家
+Id）。计算公式为：topk_scores = TopK(sqrt(softplus(router_logits)), k)，输入输出要求如下：
+类型 参数名 类型 维度形状 支持数据类型 数据格式 备注
+INPUT（必选） router_logits tensor (T, E) float16, float32 ND 路由logits
+ATTR（属性） k int - - - top-k的k，默认6
+OUTPUT（输出） topk_scores tensor (T, k) 与router_logits一致 ND 选中专家的评分（未归一化）
+■ 算子功能分解（小算子拼接）：
+① softplus评分
+exp / log1p（FP32） →
+② 开平方
+sqrt（FP32） →
+③ top-k选择
+降序排序 / bitonic sort →
+④ 输出 topk_scores
+形状(T, k)，类型同输入
+■ 约束说明：
+芯片类型：Atlas A2（910B）
+维度范围：2维输入（T, E）；T∈[1,131072]，E∈[64,1024]可为非2的幂，k∈[1,64]且k≤E
+张量大小：内存范围内的任意大小，因芯片UB大小的约束需进行切分；E非2的幂等非对齐场景需正确处理
+中间精度要求：softplus与sqrt计算必须使用FP32精度，避免大logits下exp溢出（x>20时softplus(x)≈x）https://gitcode.com/cann
+西南赛题解读
+-
+赛题背景
+■ 赛题背景：
+① AddRmsNormBias是大语言模型推理场景中的重要融合算子，在AddRmsNorm（残差
+加法+RMS归一化）的基础上进一步融合逐通道偏置加法（Channel Bias）。部分模型（如
+Gemma、某些Qwen变体）在RMS归一化后会额外加上可学习偏置（bias），而非纯缩放
+。公式为：
+𝑦𝑖 = 𝑥𝑖 + 𝑟𝑒𝑠𝑖𝑑𝑢𝑎𝑙𝑖
+𝑧𝑖 = 𝑦𝑖
+1
+𝐷 σ𝑖 𝐷 𝑦𝑖 2+𝜖
+⋅ 𝛾𝑖
+𝑜𝑢𝑡𝑝𝑢𝑡𝑖 = 𝑧𝑖 + 𝑏𝑖𝑎𝑠𝑖
+■ 赛题特点
+① 本次比赛要求使用Ascend C编程语言完成AddRmsNormBias融合算子开发
+② 在满足精度的基础上，比拼算子性能西南赛题解读
+-
+题目概述：
+AddRmsNormBias
+算子开发
+■ 题目概述：
+实现的AddRmsNormBias算子需融合三项操作：残差加法、RMS归一化、偏置加法。计算公式为：output = RMSNorm(x + residual, gamma, epsilon) + 
+bias，输入输出要求如下：
+类型 参数名 类型 维度形状 支持数据类型 数据格式 备注
+INPUT（必选） x tensor (..., D) float16, bfloat16, float32 ND 主输入张量
+INPUT（必选） residual tensor (..., D) 与x一致 ND 残差输入，shape与x一致
+INPUT（必选） gamma tensor (D,) 与x一致 ND RMS归一化缩放系数
+INPUT（必选） bias tensor (D,) 与x一致 ND 逐通道偏置
+ATTR（属性） epsilon float - - - RMS平滑项，默认1e-5
+OUTPUT（输出） output tensor (..., D) 与x一致 ND 融合计算结果
+■ 算子功能分解（小算子拼接）：
+① 残差加法
+add：y = x + residual →
+② RMS归一化
+square / mean / rsqrt / mul →
+③ 偏置加法
+add：+ bias →
+④ 输出 output
+形状、数据类型与x一致
+■ 约束说明：
+芯片类型：Atlas A2（910B）；数据类型：float16、bfloat16、float32
+维度范围：2维（batch, D)、3维（batch, seq, D)、4维（batch, seq, heads, D)；batch∈[1,8192]，seq_len∈[1,32768]，D∈[64,32768]
+形状约束：residual与x的shape完全一致；gamma和bias的shape均为(D,)
+张量大小：内存范围内任意大小，因芯片UB大小的约束需进行切分；D可能为非32整倍数（如192、576），非对齐场景需正确处理杭厦
+赛题解读
+-
+赛题背景
+■ 赛题背景：
+① 在大语言模型推理场景中，矩阵乘法是计算量最大的操作。为降低显存占用和计算延迟
+，业界广泛采用INT8量化技术。典型INT8量化推理前向中，单层计算需依次经历"量化矩阵
+乘→激活函数→动态再量化"三个阶段，分别对应不同Kernel；将三个阶段融合为单个算子
+，可显著减少kernel launch开销和中间数据搬运。公式为：
+𝑚𝑎𝑡𝑚𝑢𝑙𝑂𝑢𝑡[𝑚, 𝑛] = 𝑐𝑎𝑠𝑡𝑓𝑝32 σ𝑖=1 𝑘 𝑥1[𝑚, i] 𝑥2[i, 𝑛] ⋅ 𝑥1𝑆𝑐𝑎𝑙𝑒[𝑚] ⋅ 𝑥2𝑆𝑐𝑎𝑙𝑒[𝑛]
+𝑦[𝑚, 𝑛] = 𝑐𝑙𝑎𝑚𝑝 𝑟𝑖𝑛𝑡 𝑚𝑎𝑥(0, 𝑚𝑎𝑡𝑚𝑢𝑙𝑂𝑢𝑡[𝑚, 𝑛]) / 𝑦𝑆𝑐𝑎𝑙𝑒[𝑚] , −128, 127
+■ 赛题特点
+① 本次比赛要求使用Ascend C编程语言完成QuantMatmulReluQuant融合算子开发
+② 在满足精度的基础上，比拼算子性能（按相对拆分实现基线的加速比评分）杭厦
+赛题解读
+-
+题目概述：
+QuantMatmulReluQuant
+算子开发
+■ 题目概述：
+实现的QuantMatmulReluQuant算子需融合三阶段计算：INT8量化矩阵乘（INT32累加+反量化）、ReLU激活、动态per-token量化，输入输出要求如下：
+类型 参数名 类型 维度形状 支持数据类型 数据格式 备注
+INPUT（必选） x1 tensor (M, K) INT8 ND 矩阵乘左矩阵（激活），不转置
+INPUT（必选） x2 tensor (N, K) INT8 ND 矩阵乘右矩阵（权重，已转置）
+INPUT（必选） x1Scale tensor (M,) FLOAT32 ND x1反量化因子
+INPUT（必选） x2Scale tensor (N,) FLOAT32 ND x2反量化因子
+OUTPUT（输出） y tensor (M, N) INT8 ND 动态量化后的最终结果
+OUTPUT（输出） yScale tensor (M,) FLOAT32 ND 每行的动态量化因子
+■ 算子功能分解（小算子拼接）：
+① 量化矩阵乘+反量化
+matmul（INT32累加）/ mul →
+② ReLU激活
+max(0, ·) →
+③ 动态per-token量化
+max / div / rint / clamp →
+④ 输出 y、yScale
+INT8结果 + 行量化因子
+■ 约束说明：
+芯片类型：Atlas A2（910B）
+维度范围：2维输入，M≥1、N≥1、K≥1；x1固定不转置(M,K)，x2固定已转置(N,K)；不支持空Tensor，仅支持连续Tensor
+数据类型：x1、x2为INT8，x1Scale、x2Scale为FLOAT32；输出y为INT8、yScale为FLOAT32
+舍入规则：就近偶数舍入（rint），先round后clamp到[-128,127]；rowMax=0时yScale=1.0、对应行y全为0上合
+赛题解读
+-
+赛题背景
+■ 赛题背景：
+① 在神经信息检索和RAG重排场景中，ColBERT使用Late Interaction计算query与
+document的相关性：先计算token级点积相似度，再对每个query token执行MaxSim，
+最后求和得到query-document分数。该流程由BatchMatMul、ReduceMax和
+ReduceSum组成，融合后可减少Kernel Launch与中间数据搬运。公式为：
+𝐴[𝑏, 𝑚, 𝑛] = σ𝑖=1 𝑘 𝑋1[𝑏, 𝑚, i] × 𝑋2[𝑏, i, 𝑛], 𝐴 ∈ ℝ𝐵×𝑀×𝑁
+𝑦[𝑏] = σ𝑖=1 𝑚 𝑚𝑎𝑥 𝑛 𝐴[𝑏, i, 𝑛] , 𝑦 ∈ ℝ𝐵
+■ 赛题特点
+① 本次比赛要求使用Ascend C编程语言完成BatchMatmulMaxSum融合算子开发
+② 在满足精度的基础上，比拼算子性能（按相对拆分实现基线的加速比评分）上合
+赛题解读
+-
+题目概述：
+BatchMatmulMaxSum
+算子开发
+■ 题目概述：
+实现的BatchMatmulMaxSum算子需融合三阶段计算：批量矩阵乘、MaxSim归约（沿N取最大值）、求和归约（沿M求和），输出每个query-document 
+pair的相关性分数，输入输出要求如下：
+类型 参数名 类型 维度形状 支持数据类型 数据格式 备注
+INPUT（必选） x1 tensor 逻辑(B,M,K)；storage为(B,M,K)或 (B,K,M) FLOAT16, BFLOAT16 ND Query token embedding
+INPUT（必选） x2 tensor 逻辑(B,K,N)；storage为(B,K,N)或 (B,N,K) FLOAT16, BFLOAT16 ND Document token embedding
+ATTR（可选） transposeX1 bool - - - 声明x1的storage shape
+ATTR（可选） transposeX2 bool - - - 声明x2的storage shape
+OUTPUT（输出） y tensor (B,) FLOAT32 ND 每个query-document pair 的分数
+■ 算子功能分解（小算子拼接）：
+① 批量矩阵乘
+bmm（FP32累加） →
+② MaxSim归约
+amax 沿N维取最大值 →
+③ 求和归约
+sum 沿M维求和 →
+④ 输出 y
+形状(B,)，FLOAT32
+■ 约束说明：
+芯片类型：Atlas A2（910B）
+维度范围：B∈[1,64]，M∈[1,8192]，N∈[1,8192]，K∈[32,8192]且为8的整数倍；B×M×K≤2^26，B×N×K≤2^26
+存储布局：四种组合均需正确支持，transposeX1、transposeX2默认为false；M、N非16整数倍时需正确处理尾块
+归约顺序：必须先沿N取最大值、再沿M求和；K维点积与两级归约采用FP32累加或等效精度实现https://gitcode.com/cann
+交流答疑
+讨论贴Thank you.
+社区愿景：打造开放易用、技术领先的AI算力新生态
+社区使命：使能开发者基于CANN社区自主研究创新，构筑根深叶
+茂、跨产业协同共享共赢的CANN生态
+Vision: Building an Open, Easy-to-Use, and Technology-leading AI 
+Computing Ecosystem
+Mission: Enable developers to independently research and innovate based 
+on the CANN community and build a win-win CANN ecosystem with deep 
+roots and cross-industry collaboration and sharing.
+上CANN社区获取干货 关注CANN公众号获取资讯
+https://gitcode.com/cann

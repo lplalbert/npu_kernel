@@ -1,0 +1,487 @@
+[
+  {
+    "kind": "ladder",
+    "op": "trace",
+    "base": "trace",
+    "src": "_sec5_build\\ascend_tasks\\ladder_work\\trace",
+    "layout": "project",
+    "files": [
+      "op_host/trace_def.cpp",
+      "op_host/trace_infershape.cpp",
+      "op_host/trace_tiling.cpp",
+      "op_kernel/trace.cpp",
+      "op_kernel/trace.h",
+      "op_kernel/trace_tiling_data.h",
+      "op_kernel/trace_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\trace_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "multi_add_rms_norm_dynamic_quant",
+    "base": "multi_add_rms_norm_dynamic_quant",
+    "src": "_sec5_build\\fixa\\src\\marn_official",
+    "layout": "project",
+    "files": [
+      "op_host/multi_add_rms_norm_dynamic_quant_def.cpp",
+      "op_host/multi_add_rms_norm_dynamic_quant_infershape.cpp",
+      "op_host/multi_add_rms_norm_dynamic_quant_tiling.cpp",
+      "op_kernel/multi_add_rms_norm_dynamic_quant.cpp",
+      "op_kernel/multi_add_rms_norm_dynamic_quant.h",
+      "op_kernel/multi_add_rms_norm_dynamic_quant_tiling_data.h",
+      "op_kernel/multi_add_rms_norm_dynamic_quant_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\multi_add_rms_norm_dynamic_quant_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "confusion_mul_grad",
+    "base": "confusion_mul_grad",
+    "src": "_it6\\cmg",
+    "layout": "project",
+    "files": [
+      "op_host/confusion_mul_grad_def.cpp",
+      "op_host/confusion_mul_grad_infershape.cpp",
+      "op_host/confusion_mul_grad_tiling.cpp",
+      "op_kernel/confusion_mul_grad.cpp",
+      "op_kernel/confusion_mul_grad.h",
+      "op_kernel/confusion_mul_grad_tiling_data.h",
+      "op_kernel/confusion_mul_grad_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\confusion_mul_grad_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "bit_plane_transform",
+    "base": "bit_plane_transform",
+    "src": "bpt_work",
+    "layout": "flat",
+    "files": [
+      "op_host/bit_plane_transform_def.cpp",
+      "op_host/bit_plane_transform_infershape.cpp",
+      "op_host/bit_plane_transform_tiling.cpp",
+      "op_kernel/bit_plane_transform.cpp",
+      "op_kernel/bit_plane_transform.h",
+      "op_kernel/bit_plane_transform_tiling_data.h",
+      "op_kernel/bit_plane_transform_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\bit_plane_transform_7files.zip",
+    "note": "部分文件从评审包 md 还原"
+  },
+  {
+    "kind": "ladder",
+    "op": "gf2k_mul_square",
+    "base": "gf2k_mul_square",
+    "src": "_fixb\\gf2",
+    "layout": "project",
+    "files": [
+      "op_host/gf2k_mul_square_def.cpp",
+      "op_host/gf2k_mul_square_infershape.cpp",
+      "op_host/gf2k_mul_square_tiling.cpp",
+      "op_kernel/gf2k_mul_square.cpp",
+      "op_kernel/gf2k_mul_square.h",
+      "op_kernel/gf2k_mul_square_tiling_data.h",
+      "op_kernel/gf2k_mul_square_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\gf2k_mul_square_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "gf2_poly",
+    "base": "gf2_poly",
+    "src": "_fixb\\gf2poly",
+    "layout": "project",
+    "files": [
+      "op_host/gf2_poly_def.cpp",
+      "op_host/gf2_poly_infershape.cpp",
+      "op_host/gf2_poly_tiling.cpp",
+      "op_kernel/gf2_poly.cpp",
+      "op_kernel/gf2_poly.h",
+      "op_kernel/gf2_poly_tiling_data.h",
+      "op_kernel/gf2_poly_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\gf2_poly_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "mhc_sinkhorn_grad",
+    "base": "mhc_sinkhorn_grad",
+    "src": "_fixc\\msg",
+    "layout": "project",
+    "files": [
+      "op_host/mhc_sinkhorn_grad_def.cpp",
+      "op_host/mhc_sinkhorn_grad_infershape.cpp",
+      "op_host/mhc_sinkhorn_grad_tiling.cpp",
+      "op_kernel/mhc_sinkhorn_grad.cpp",
+      "op_kernel/mhc_sinkhorn_grad.h",
+      "op_kernel/mhc_sinkhorn_grad_tiling_data.h",
+      "op_kernel/mhc_sinkhorn_grad_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\mhc_sinkhorn_grad_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "flash_attention",
+    "base": "flash_attention",
+    "src": null,
+    "layout": "recover",
+    "files": [
+      "op_host/flash_attention_def.cpp",
+      "op_host/flash_attention_infershape.cpp",
+      "op_host/flash_attention_tiling.cpp",
+      "op_kernel/flash_attention.cpp",
+      "op_kernel/flash_attention.h",
+      "op_kernel/flash_attention_tiling_data.h",
+      "op_kernel/flash_attention_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\flash_attention_7files.zip",
+    "note": "部分文件从评审包 md 还原"
+  },
+  {
+    "kind": "ladder",
+    "op": "conv_transpose2_d",
+    "base": "conv_transpose2_d",
+    "src": "ct2d_deliverable",
+    "layout": "project",
+    "files": [
+      "op_host/conv_transpose2_d_def.cpp",
+      "op_host/conv_transpose2_d_infershape.cpp",
+      "op_host/conv_transpose2_d_tiling.cpp",
+      "op_kernel/conv_transpose2_d.cpp",
+      "op_kernel/conv_transpose2_d.h",
+      "op_kernel/conv_transpose2_d_tiling_data.h",
+      "op_kernel/conv_transpose2_d_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\conv_transpose2_d_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "quant_matmul_sigmoid_mul_quant",
+    "base": "quant_matmul_sigmoid_mul_quant",
+    "src": "local\\qmsq",
+    "layout": "project",
+    "files": [
+      "op_host/quant_matmul_sigmoid_mul_quant_def.cpp",
+      "op_host/quant_matmul_sigmoid_mul_quant_infershape.cpp",
+      "op_host/quant_matmul_sigmoid_mul_quant_tiling.cpp",
+      "op_kernel/quant_matmul_sigmoid_mul_quant.cpp",
+      "op_kernel/quant_matmul_sigmoid_mul_quant.h",
+      "op_kernel/quant_matmul_sigmoid_mul_quant_tiling_data.h",
+      "op_kernel/quant_matmul_sigmoid_mul_quant_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\quant_matmul_sigmoid_mul_quant_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "mse_loss",
+    "base": "mse_loss",
+    "src": "_mse_src",
+    "layout": "project",
+    "files": [
+      "op_host/mse_loss_def.cpp",
+      "op_host/mse_loss_infershape.cpp",
+      "op_host/mse_loss_tiling.cpp",
+      "op_kernel/mse_loss.cpp",
+      "op_kernel/mse_loss.h",
+      "op_kernel/mse_loss_tiling_data.h",
+      "op_kernel/mse_loss_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\mse_loss_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "group_norm",
+    "base": "group_norm",
+    "src": "_ladder\\src\\gn",
+    "layout": "mixed",
+    "files": [
+      "op_host/group_norm_def.cpp",
+      "op_host/group_norm_infershape.cpp",
+      "op_host/group_norm_tiling.cpp",
+      "op_kernel/group_norm.cpp",
+      "op_kernel/group_norm.h",
+      "op_kernel/group_norm_tiling_data.h",
+      "op_kernel/group_norm_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\group_norm_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "group_norm_silu_quant",
+    "base": "group_norm_silu_quant",
+    "src": "_ladder_gnsq\\gnsq",
+    "layout": "project",
+    "files": [
+      "op_host/group_norm_silu_quant_def.cpp",
+      "op_host/group_norm_silu_quant_infershape.cpp",
+      "op_host/group_norm_silu_quant_tiling.cpp",
+      "op_kernel/group_norm_silu_quant.cpp",
+      "op_kernel/group_norm_silu_quant.h",
+      "op_kernel/group_norm_silu_quant_tiling_data.h",
+      "op_kernel/group_norm_silu_quant_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\group_norm_silu_quant_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "index",
+    "base": "index",
+    "src": "_it1_work",
+    "layout": "zip",
+    "files": [
+      "op_host/index_def.cpp",
+      "op_host/index_infershape.cpp",
+      "op_host/index_tiling.cpp",
+      "op_kernel/index.cpp",
+      "op_kernel/index.h",
+      "op_kernel/index_tiling_data.h",
+      "op_kernel/index_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\index_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "bn_training_update",
+    "base": "bn_training_update",
+    "src": "bn_src",
+    "layout": "project",
+    "files": [
+      "op_host/bn_training_update_def.cpp",
+      "op_host/bn_training_update_infershape.cpp",
+      "op_host/bn_training_update_tiling.cpp",
+      "op_kernel/bn_training_update.cpp",
+      "op_kernel/bn_training_update.h",
+      "op_kernel/bn_training_update_tiling_data.h",
+      "op_kernel/bn_training_update_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\bn_training_update_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "depthwise_conv2_d",
+    "base": "depthwise_conv2_d",
+    "src": "dwc_work\\src",
+    "layout": "project",
+    "files": [
+      "op_host/depthwise_conv2_d_def.cpp",
+      "op_host/depthwise_conv2_d_infershape.cpp",
+      "op_host/depthwise_conv2_d_tiling.cpp",
+      "op_kernel/depthwise_conv2_d.cpp",
+      "op_kernel/depthwise_conv2_d.h",
+      "op_kernel/depthwise_conv2_d_tiling_data.h",
+      "op_kernel/depthwise_conv2_d_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\depthwise_conv2_d_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "cube1",
+    "base": "quant_batch_mat_mul_v3",
+    "src": "cube1_work\\cube1",
+    "layout": "project",
+    "files": [
+      "op_host/quant_batch_mat_mul_v3_def.cpp",
+      "op_host/quant_batch_mat_mul_v3_infershape.cpp",
+      "op_host/quant_batch_mat_mul_v3_tiling.cpp",
+      "op_kernel/quant_batch_mat_mul_v3.cpp",
+      "op_kernel/quant_batch_mat_mul_v3.h",
+      "op_kernel/quant_batch_mat_mul_v3_tiling_data.h",
+      "op_kernel/quant_batch_mat_mul_v3_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\cube1_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "ladder",
+    "op": "cube2",
+    "base": "quant_batch_mat_mul_v3",
+    "src": "cube2_work",
+    "layout": "project",
+    "files": [
+      "op_host/quant_batch_mat_mul_v3_def.cpp",
+      "op_host/quant_batch_mat_mul_v3_infershape.cpp",
+      "op_host/quant_batch_mat_mul_v3_tiling.cpp",
+      "op_kernel/quant_batch_mat_mul_v3.cpp",
+      "op_kernel/quant_batch_mat_mul_v3.h",
+      "op_kernel/quant_batch_mat_mul_v3_tiling_data.h",
+      "op_kernel/quant_batch_mat_mul_v3_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "ladder\\zips\\cube2_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "spspmm",
+    "base": "spspmm",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\remote\\spspmm",
+    "layout": "project",
+    "files": [
+      "op_host/spspmm.cpp",
+      "op_kernel/spspmm.cpp",
+      "op_kernel/spspmm_tiling.h",
+      "op_kernel/tiling_key_spspmm.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\spspmm_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "fourier_transform2d",
+    "base": "fourier_transform2_d",
+    "src": "_sec5_build\\ascend_tasks\\mfg_work\\fouriertransform2d",
+    "layout": "project",
+    "files": [
+      "op_host/fourier_transform2_d.cpp",
+      "op_kernel/fourier_transform2_d.cpp",
+      "op_kernel/fourier_transform2_d_tiling.h",
+      "op_kernel/tiling_key_fourier_transform2_d.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\fourier_transform2d_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "mfg",
+    "op": "fused_prop_step",
+    "base": "fused_prop_step",
+    "src": "mfg_fps",
+    "layout": "flat_mfg",
+    "files": [
+      "op_host/fused_prop_step.cpp",
+      "op_kernel/fused_prop_step.cpp",
+      "op_kernel/fused_prop_step_tiling.h",
+      "op_kernel/tiling_key_fused_prop_step.h"
+    ],
+    "missing": [],
+    "zip": "mfg\\zips\\fused_prop_step_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "s10",
+    "op": "mish",
+    "base": "mish",
+    "src": "_sec5_build\\ascend_tasks\\s10_work\\mish",
+    "layout": "project",
+    "files": [
+      "op_host/mish_def.cpp",
+      "op_host/mish_infershape.cpp",
+      "op_host/mish_tiling.cpp",
+      "op_kernel/mish.cpp",
+      "op_kernel/mish.h",
+      "op_kernel/mish_tiling_data.h",
+      "op_kernel/mish_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "s10\\zips\\mish_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "s10",
+    "op": "reduce_log_sum_exp",
+    "base": "reduce_log_sum_exp",
+    "src": "_sec5_build\\ascend_tasks\\s10_work\\reduce_log_sum_exp",
+    "layout": "project",
+    "files": [
+      "op_host/reduce_log_sum_exp_def.cpp",
+      "op_host/reduce_log_sum_exp_infershape.cpp",
+      "op_host/reduce_log_sum_exp_tiling.cpp",
+      "op_kernel/reduce_log_sum_exp.cpp",
+      "op_kernel/reduce_log_sum_exp.h",
+      "op_kernel/reduce_log_sum_exp_tiling_data.h",
+      "op_kernel/reduce_log_sum_exp_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "s10\\zips\\reduce_log_sum_exp_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "s10",
+    "op": "dot",
+    "base": "dot",
+    "src": "_sec5_build\\ascend_tasks\\s10_work\\dot",
+    "layout": "project",
+    "files": [
+      "op_host/dot_def.cpp",
+      "op_host/dot_infershape.cpp",
+      "op_host/dot_tiling.cpp",
+      "op_kernel/dot.cpp",
+      "op_kernel/dot.h",
+      "op_kernel/dot_tiling_data.h",
+      "op_kernel/dot_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "s10\\zips\\dot_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "s10",
+    "op": "poisson_nll_loss",
+    "base": "poisson_nll_loss",
+    "src": "_sec5_build\\ascend_tasks\\s10_work\\poisson_nll_loss",
+    "layout": "project",
+    "files": [
+      "op_host/poisson_nll_loss_def.cpp",
+      "op_host/poisson_nll_loss_infershape.cpp",
+      "op_host/poisson_nll_loss_tiling.cpp",
+      "op_kernel/poisson_nll_loss.cpp",
+      "op_kernel/poisson_nll_loss.h",
+      "op_kernel/poisson_nll_loss_tiling_data.h",
+      "op_kernel/poisson_nll_loss_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "s10\\zips\\poisson_nll_loss_7files.zip",
+    "note": ""
+  },
+  {
+    "kind": "s10",
+    "op": "bessel_i0e",
+    "base": "bessel_i0e",
+    "src": "_sec5_build\\ascend_tasks\\s10_work\\bessel_i0e",
+    "layout": "project",
+    "files": [
+      "op_host/bessel_i0e_def.cpp",
+      "op_host/bessel_i0e_infershape.cpp",
+      "op_host/bessel_i0e_tiling.cpp",
+      "op_kernel/bessel_i0e.cpp",
+      "op_kernel/bessel_i0e.h",
+      "op_kernel/bessel_i0e_tiling_data.h",
+      "op_kernel/bessel_i0e_tiling_key.h"
+    ],
+    "missing": [],
+    "zip": "s10\\zips\\bessel_i0e_7files.zip",
+    "note": ""
+  }
+]

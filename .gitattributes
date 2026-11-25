@@ -1,0 +1,11 @@
+﻿# 不要让 Windows/macOS 自动换行，避免 zip 与源码 md5 漂移
+* -text
+
+# 构建产物 / 临时文件
+build/
+build_out/
+*.o
+*.run
+*.log
+__pycache__/
+*.pyc

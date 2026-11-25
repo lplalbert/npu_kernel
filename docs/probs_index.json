@@ -1,0 +1,106 @@
+{
+  "mfg": [
+    {
+      "pid": "6af1c67a6bd0f9be3792fb4a",
+      "name": "cylinderquery",
+      "canonical": "cylinderquery"
+    },
+    {
+      "pid": "6af1c8736bd0f9be37971169",
+      "name": "furthestpointsample",
+      "canonical": "furthestpointsample"
+    },
+    {
+      "pid": "6af1c92b6bd0f9be3798a712",
+      "name": "ballquery",
+      "canonical": "ballquery"
+    },
+    {
+      "pid": "6af1ca066bd0f9be379a6c84",
+      "name": "radius",
+      "canonical": "radius"
+    },
+    {
+      "pid": "6af1cab46bd0f9be379bc6c6",
+      "name": "gridcluster",
+      "canonical": "gridcluster"
+    },
+    {
+      "pid": "6af1cbe56bd0f9be379e1c23",
+      "name": "gathercoo",
+      "canonical": "gathercoo"
+    },
+    {
+      "pid": "6af1cdaa6bd0f9be37a1afe1",
+      "name": "segmentmincsr",
+      "canonical": "segmentmincsr"
+    },
+    {
+      "pid": "6af275c16bd0f9be37a3bbd5",
+      "name": "spmmsum",
+      "canonical": "spmmsum"
+    },
+    {
+      "pid": "6af276736bd0f9be37a4cb08",
+      "name": "spspmm",
+      "canonical": "spspmm"
+    },
+    {
+      "pid": "6af277846bd0f9be37a6755a",
+      "name": "randomwalk",
+      "canonical": "randomwalk"
+    },
+    {
+      "pid": "6af2d3706bd0f9be375466ed",
+      "name": "complexabs",
+      "canonical": "complexabs"
+    },
+    {
+      "pid": "6af2d43a6bd0f9be3756251e",
+      "name": "complexdiv",
+      "canonical": "complexdiv"
+    },
+    {
+      "pid": "6af2d5b76bd0f9be3759446c",
+      "name": "fusedpropstep",
+      "canonical": "fusedpropstep"
+    },
+    {
+      "pid": "6af2d6646bd0f9be375ab041",
+      "name": "fouriertransform2d",
+      "canonical": "fouriertransform2d"
+    },
+    {
+      "pid": "6af6cbd36bd0f9be37ba0aae",
+      "name": "complexexp__v2",
+      "canonical": "complexexp"
+    }
+  ],
+  "s10": [
+    {
+      "pid": "6ad9cfab3ff2fef7e8227643",
+      "name": "mish",
+      "canonical": "mish"
+    },
+    {
+      "pid": "6ad9d3523ff2fef7e82428fe",
+      "name": "bessel_i0e",
+      "canonical": "bessel_i0e"
+    },
+    {
+      "pid": "6ad9d4bb3ff2fef7e824d520",
+      "name": "dot",
+      "canonical": "dot"
+    },
+    {
+      "pid": "6ad9d60b3ff2fef7e8257053",
+      "name": "poisson_nll_loss",
+      "canonical": "poisson_nll_loss"
+    },
+    {
+      "pid": "6ad9d7423ff2fef7e82610ca",
+      "name": "reduce_log_sum_exp",
+      "canonical": "reduce_log_sum_exp"
+    }
+  ]
+}
