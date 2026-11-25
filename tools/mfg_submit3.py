@@ -3,9 +3,8 @@
 """提交 mfg 三道题（4 文件结构），处理 429 冷却，并轮询结果。"""
 import json, os, re, subprocess, sys, time
 
-COOKIE = ("cannjudge_auth=<CANNJUDGE_JWT_REDACTED>"
-          ".<CANNJUDGE_JWT_REDACTED>")
-USER_ID = "<MY_USER_ID>"
+COOKIE = f"cannjudge_auth={os.environ.get('CANNJUDGE_JWT', '')}"
+USER_ID = os.environ.get("CANNJUDGE_USER", "<MY_USER_ID>")
 BASE = "https://cannjudge.cn/api"
 
 PROBS = [

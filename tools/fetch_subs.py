@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """从 CANNJudge 拉取本账号在各题上的最新提交（submissionId/status/precision）。"""
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-JWT = ("<CANNJUDGE_JWT_REDACTED>"
-       ".<CANNJUDGE_JWT_REDACTED>")
-USER = "<MY_USER_ID>"
+JWT = os.environ.get("CANNJUDGE_JWT", "")
+USER = os.environ.get("CANNJUDGE_USER", "<MY_USER_ID>")
 H = {"Cookie": f"cannjudge_auth={JWT}", "Accept": "application/json",
      "User-Agent": "Mozilla/5.0"}
 BASE = "https://cannjudge.cn"
