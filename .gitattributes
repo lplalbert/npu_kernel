@@ -1,7 +1,7 @@
-﻿# 不要让 Windows/macOS 自动换行，避免 zip 与源码 md5 漂移
+# Keep bytes as-is; avoid CRLF conversion so zip <-> source md5 stays stable
 * -text
 
-# 构建产物 / 临时文件
+# Build products / temp files
 build/
 build_out/
 *.o
@@ -9,3 +9,4 @@ build_out/
 *.log
 __pycache__/
 *.pyc
+.vscode/
