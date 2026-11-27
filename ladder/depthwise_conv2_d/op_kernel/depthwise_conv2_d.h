@@ -40,6 +40,7 @@
 #define DEPTHWISECONV2D_H
 
 #include "kernel_operator.h"
+#include "adv_api/index/arithprogression.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "depthwise_conv2_d_tiling_data.h"
 #include "depthwise_conv2_d_tiling_key.h"
@@ -125,6 +126,7 @@ private:
     int64_t chunk_ = 1024;
     int32_t hasBias_ = 0;
     int32_t useScalar_ = 0;
+    float biasCur_ = 0.0f;   /* bias of the currently staged channel */
     int64_t wLoaded_ = -1;
 };
 
@@ -223,19 +225,34 @@ __aicore__ inline void DepthwiseConv2D<T>::Init(GM_ADDR x, GM_ADDR w, GM_ADDR b,
     }
 
     /* base2 byte-offset table: lane L = r*wout + ow -> (r*stride*WPtile + ow*stride)*4
-     * bytes.  Tail lanes (L >= R*wout) point at element 0 (in bounds, ignored on
-     * the store). */
+     * bytes.  Tail lanes (L >= R*wout) stay 0 (element 0 is in bounds and ignored
+     * on the store).  Built with vector Arange instead of a per-element scalar
+     * SetValue loop, which was the dominant cost of small shapes: each row-group
+     * r is an arithmetic progression.  A per-group segment only starts on a 32B
+     * boundary when R==1 or wout%8==0; otherwise fall back to a division-free
+     * scalar loop (rare, R>1 with an unaligned wout). */
     LocalTensor<int32_t> idx = fIdx.Get<int32_t>();
-    const int64_t packLen = R_ * wout_;
-    for (int64_t L = 0; L < count_; ++L) {
-        int32_t off = 0;
-        if (L < packLen) {
-            int64_t r = L / wout_;
-            int64_t ow = L - r * wout_;
-            int64_t e = r * stride_ * WPtile_ + ow * stride_;
-            off = static_cast<int32_t>(e * 4);
+    Duplicate<int32_t>(idx, 0, static_cast<int32_t>(count_));
+    if (R_ == 1 || (wout_ % 8) == 0) {
+        for (int64_t r = 0; r < R_; ++r) {
+            int32_t first = static_cast<int32_t>(r * stride_ * WPtile_ * 4);
+            Arange<int32_t>(idx[static_cast<int32_t>(r * wout_)], first,
+                            static_cast<int32_t>(stride_ * 4), static_cast<int32_t>(wout_));
         }
-        idx.SetValue(static_cast<int32_t>(L), off);
+    } else {
+        int64_t r = 0;
+        int64_t ow = 0;
+        for (int64_t L = 0; L < count_; ++L) {
+            int32_t off = 0;
+            if (L < R_ * wout_) {
+                off = static_cast<int32_t>((r * stride_ * WPtile_ + ow * stride_) * 4);
+            }
+            idx.SetValue(static_cast<int32_t>(L), off);
+            if (++ow >= wout_) {
+                ow = 0;
+                ++r;
+            }
+        }
     }
     PipeBarrier<PIPE_ALL>();
 }
@@ -258,6 +275,9 @@ __aicore__ inline void DepthwiseConv2D<T>::LoadWeights(int64_t c)
         DataCopyPad(wh, wGm[c * nw_], p, DataCopyPadExtParams<T>{false, 0, 0, 0});
         PipeBarrier<PIPE_ALL>();
         Cast(fw, wh, RoundMode::CAST_NONE, static_cast<int32_t>(wPad_));
+    }
+    if (hasBias_ != 0) {
+        biasCur_ = biasGm.GetValue(c);
     }
     wLoaded_ = c;
 }
@@ -387,8 +407,7 @@ __aicore__ inline void DepthwiseConv2D<T>::DoGroup(int64_t group)
         }
     }
     if (hasBias_ != 0) {
-        float bias = biasGm.GetValue(c);
-        Adds(acc, acc, bias, static_cast<uint32_t>(count_));
+        Adds(acc, acc, biasCur_, static_cast<uint32_t>(count_));
     }
 
     int64_t outBase = (plane * hout_ + oh0) * wout_;

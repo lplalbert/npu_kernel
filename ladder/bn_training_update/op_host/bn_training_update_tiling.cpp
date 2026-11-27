@@ -25,7 +25,7 @@ constexpr uint32_t WS_SYS_SIZE = 0U;
 constexpr int64_t kAlign = 64;
 constexpr int64_t kMaxUb = 4096;
 constexpr int64_t kMinUb = 64;
-constexpr int64_t kChanBytes = 20;   // 5 fp32 per-channel tables
+constexpr int64_t kChanBytes = 24;   // 5 fp32 per-channel tables
 constexpr int64_t kMaxChan = 8192;
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
@@ -116,13 +116,12 @@ static ge::graphStatus BnTrainingUpdateTilingFunc(gert::TilingContext* context)
         if (ub < kMinUb) ub = kMinUb;
     }
 
-    tiling->totalNum = total;
-    tiling->blockFactor = rowsPerCore;   /* rows per core */
-    tiling->ubFactor = ub;
-    tiling->channelNum = c;
-    tiling->rowLength = s;
-    tiling->totalRows = rows;
-    tiling->elemsPerChannel = nElem;
+    tiling->blockFactor = static_cast<int32_t>(rowsPerCore);   /* rows per core */
+    tiling->ubFactor = static_cast<int32_t>(ub);
+    tiling->channelNum = static_cast<int32_t>(c);
+    tiling->rowLength = static_cast<int32_t>(s);
+    tiling->totalRows = static_cast<int32_t>(rows);
+    tiling->elemsPerChannel = static_cast<int32_t>(nElem);
     tiling->epsilon = epsilon;
     tiling->usedCores = static_cast<int32_t>(usedCores);
 

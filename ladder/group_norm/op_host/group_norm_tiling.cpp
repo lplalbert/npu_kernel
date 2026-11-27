@@ -110,14 +110,11 @@ static ge::graphStatus GroupNormTilingFunc(gert::TilingContext* context)
     if (blockDim > totalGroups) blockDim = totalGroups;
     if (blockDim < 1) blockDim = 1;
 
-    tiling->N = N;
-    tiling->C = C;
-    tiling->G = G;
-    tiling->CpG = CpG;
-    tiling->HW = HW;
-    tiling->gsz = gsz;
-    tiling->totalGroups = totalGroups;
-    tiling->chunk = chunk;
+    tiling->totalGroups = static_cast<int32_t>(totalGroups);
+    tiling->G = static_cast<int32_t>(G);
+    tiling->CpG = static_cast<int32_t>(CpG);
+    tiling->HW = static_cast<int32_t>(HW);
+    tiling->chunk = static_cast<int32_t>(chunk);
     tiling->epsilon = epsilon;
 
     context->SetBlockDim(static_cast<uint32_t>(blockDim));

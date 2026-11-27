@@ -1,6 +1,6 @@
 /*!
  * \file group_norm_silu_quant_tiling_key.h
- * \brief Tiling 模板参数定义
+ * \brief Tiling
  */
 
 #ifndef __GROUPNORMSILUQUANT_TILING_KEY_H__

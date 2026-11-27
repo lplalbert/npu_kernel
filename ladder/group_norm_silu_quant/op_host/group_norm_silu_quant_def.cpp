@@ -1,6 +1,6 @@
 /*!
  * \file group_norm_silu_quant_def.cpp
- * \brief GroupNormSiluQuant 算子定义
+ * \brief GroupNormSiluQuant
  */
 #include "register/op_def_registry.h"
 

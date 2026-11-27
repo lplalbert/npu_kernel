@@ -1,6 +1,6 @@
 /*!
  * \file quant_matmul_sigmoid_mul_quant_def.cpp
- * \brief QuantMatmulSigmoidMulQuant
+ * \brief QuantMatmulSigmoidMulQuant 算子定义
  */
 #include "register/op_def_registry.h"
 

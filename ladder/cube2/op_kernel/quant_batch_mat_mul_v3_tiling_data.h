@@ -21,6 +21,9 @@ struct alignas(8) QuantBatchMatMulV3TilingData {
     int64_t sysWs = 0;   // lib-api workspace bytes that precede the user area
     int32_t gridM = 1;   // number of row tiles of the output grid
     int32_t gridN = 1;   // number of column tiles of the output grid
+    int32_t kc = 0;      // K chunk (0 => single chunk, loop-based fallback)
+    int32_t gridK = 1;   // number of K slices (each core owns one; 1 => M/N grid mode)
+    int32_t slowPath = 0;
 };
 #pragma pack(pop)
 

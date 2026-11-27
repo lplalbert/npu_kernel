@@ -1,4 +1,4 @@
-/*!
+﻿/*!
  * \file quant_batch_mat_mul_v3_tiling.cpp
  * \brief host tiling: Matmul(cube) tiling for an explicit per-core output grid.
  */
@@ -14,6 +14,7 @@
 namespace optiling {
 
 constexpr int32_t QBMM_TILING_MAGIC = 0x51424D33;
+constexpr int64_t QBMM_KC = 16384;  /* keep in sync with the kernel */
 
 static ge::graphStatus QuantBatchMatMulV3TilingFunc(gert::TilingContext* context)
 {
@@ -58,28 +59,23 @@ static ge::graphStatus QuantBatchMatMulV3TilingFunc(gert::TilingContext* context
     int64_t aicNum = ascendcPlatform.GetCoreNumAic();
     if (aicNum <= 0) { aicNum = 1; }
 
-    /* Pick the output grid. Pure M-split across all cores is empirically fastest
-     * (a narrow column tile makes the L1 copy of B strided and ~3x slower), so N is
-     * only split when there are not enough rows to fill the cores; the column tile is
-     * kept >= min(n,512) wide. */
-    int64_t nPerFloor = (n < ((m < 64) ? 64 : 128)) ? n : ((m < 64) ? 64 : 128);
-    int64_t bestTm = 1, bestTn = 1, bestCost = -1;
-    for (int64_t tn = 1; tn <= aicNum && tn <= n; ++tn) {
-        int64_t tm = aicNum / tn;
-        if (tm > m) { tm = m; }
-        if (tm < 1) { continue; }
-        int64_t mPer = (m + tm - 1) / tm;
-        int64_t nPer = (n + tn - 1) / tn;
-        if (nPer < nPerFloor) { continue; }
-        int64_t cost = mPer + nPer;
-        if (bestCost < 0 || cost < bestCost) { bestCost = cost; bestTm = tm; bestTn = tn; }
-    }
-    int64_t gridM = bestTm;
-    int64_t gridN = bestTn;
-    int64_t mPer = (m + gridM - 1) / gridM;
-    int64_t nPer = (n + gridN - 1) / gridN;
-    t->gridM = static_cast<int32_t>(gridM);
-    t->gridN = static_cast<int32_t>(gridN);
+    /* Small M/N, large K: split K across the cores. Every core owns a disjoint K slice,
+     * so A and B are each read exactly once over the whole grid (no per-row B re-read),
+     * and the exact int32 partials are atomically accumulated into the shared C. */
+    int64_t gridK = aicNum;
+    if (gridK > k) { gridK = k; }
+    if (gridK < 1) { gridK = 1; }
+    int64_t kPer = (k + gridK - 1) / gridK;
+    kPer = ((kPer + 63) / 64) * 64;
+    if (kPer < 64) { kPer = 64; }
+    if (kPer > 65534) { kPer = 65534; }
+    gridK = (k + kPer - 1) / kPer;
+    int64_t mPer = m;
+    int64_t nPer = n;
+    t->gridK = static_cast<int32_t>(gridK);
+    t->gridM = 1;
+    t->gridN = 1;
+    t->kc = static_cast<int32_t>(kPer);
 
     /* Tile the matmul for one core's output tile; the runtime SetOrgShape() supplies
      * the real leading dimensions of A / B / C. */
@@ -88,7 +84,9 @@ static ge::graphStatus QuantBatchMatMulV3TilingFunc(gert::TilingContext* context
     mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT8, transB);
     mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT32);
     mm.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT32);
-    mm.SetShape(static_cast<int32_t>(mPer), static_cast<int32_t>(nPer), static_cast<int32_t>(k));
+    const int64_t kTile = kPer;
+    t->slowPath = 0;
+    mm.SetShape(static_cast<int32_t>(mPer), static_cast<int32_t>(nPer), static_cast<int32_t>(kTile));
     mm.SetOrgShape(static_cast<int32_t>(m), static_cast<int32_t>(n), static_cast<int32_t>(k));
     mm.SetBias(false);
     mm.SetBufferSpace(-1, -1, -1);
@@ -111,7 +109,7 @@ static ge::graphStatus QuantBatchMatMulV3TilingFunc(gert::TilingContext* context
     OP_CHECK_NULL_WITH_CONTEXT(context, ws);
     ws[0] = sysWs + static_cast<size_t>(m * n) * sizeof(int32_t) + 4096;
 
-    uint32_t blockDim = static_cast<uint32_t>(gridM * gridN);
+    uint32_t blockDim = static_cast<uint32_t>(gridK);
 
 
     context->SetBlockDim(blockDim);

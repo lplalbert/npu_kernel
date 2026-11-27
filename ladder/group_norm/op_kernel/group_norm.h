@@ -80,19 +80,21 @@ __aicore__ inline void GroupNorm<T>::Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta
                                           const GroupNormTilingData* tilingData)
 {
     t_ = *tilingData;
-    const int64_t total = t_.N * t_.C * t_.HW;
+    const int64_t total = static_cast<int64_t>(t_.totalGroups) * t_.CpG * t_.HW;
     xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(x), total);
     yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(y), total);
-    gGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(gamma), t_.C);
-    bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(beta), t_.C);
+    gGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(gamma), t_.G * t_.CpG);
+    bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(beta), t_.G * t_.CpG);
 
     const uint32_t ch = static_cast<uint32_t>(t_.chunk);
     pipe.InitBuffer(inQ_, 2, ch * (uint32_t)sizeof(T));
     pipe.InitBuffer(outQ_, 2, ch * (uint32_t)sizeof(T));
     pipe.InitBuffer(fx_, ch * 4);
     pipe.InitBuffer(sq_, ch * 4);
-    pipe.InitBuffer(acc_, ch * 4);
-    pipe.InitBuffer(acc2_, ch * 4);
+    if (static_cast<int64_t>(t_.CpG) * t_.HW > t_.chunk) {
+        pipe.InitBuffer(acc_, ch * 4);
+        pipe.InitBuffer(acc2_, ch * 4);
+    }
     pipe.InitBuffer(work_, ch * 4);
     pipe.InitBuffer(work2_, ch * 4);
     pipe.InitBuffer(red_, 64 * 4);
@@ -124,6 +126,15 @@ __aicore__ inline void GroupNorm<T>::LoadTile(const LocalTensor<float>& dstF, in
         Adds(dstF, inV, 0.0f, static_cast<int32_t>(cntR));
     }
     inQ_.FreeTensor(inV);
+    // DataCopyPad zero-fills only up to the next 32B boundary; lanes between that
+    // boundary and the 64-element vector alignment are stale UB. Zero them (the
+    // start address is 32B aligned by construction) so the pass-1 shift leaves
+    // the tail at exactly 0, matching the old scalar lane patch.
+    const int64_t padEnd = cnt + padElems;
+    if (padEnd < cntR) {
+        LocalTensor<float> tail = dstF[static_cast<uint32_t>(padEnd)];
+        Duplicate(tail, 0.0f, static_cast<int32_t>(cntR - padEnd));
+    }
 }
 
 template <typename T>
@@ -154,7 +165,7 @@ __aicore__ inline void GroupNorm<T>::ProcessGroup(int64_t gidx)
 {
     const int64_t CpG = t_.CpG;
     const int64_t HW = t_.HW;
-    const int64_t gsz = t_.gsz;
+    const int64_t gsz = CpG * HW;
     const int64_t chunk = t_.chunk;
     const int64_t G = t_.G;
     const float eps = t_.epsilon;
@@ -164,16 +175,24 @@ __aicore__ inline void GroupNorm<T>::ProcessGroup(int64_t gidx)
 
     LocalTensor<float> fx = fx_.Get<float>();
     LocalTensor<float> sq = sq_.Get<float>();
-    LocalTensor<float> acc = acc_.Get<float>();
-    LocalTensor<float> acc2 = acc2_.Get<float>();
+    LocalTensor<float> acc;
+    LocalTensor<float> acc2;
     LocalTensor<float> work = work_.Get<float>();
     LocalTensor<float> work2 = work2_.Get<float>();
     LocalTensor<float> red = red_.Get<float>();
     LocalTensor<float> red2 = red2_.Get<float>();
 
     // ---- pass 1: shifted sum and shifted sum of squares ----
-    Duplicate(acc, 0.0f, static_cast<int32_t>(chunk));
-    Duplicate(acc2, 0.0f, static_cast<int32_t>(chunk));
+    // A single-tile group is its own accumulator: the reduction input is the
+    // (x-x0) / (x-x0)^2 tile itself, bit-identical to accumulating into a
+    // zero-initialised vector accumulator.
+    const bool singleTile = (gsz <= chunk);
+    if (!singleTile) {
+        acc = acc_.Get<float>();
+        acc2 = acc2_.Get<float>();
+        Duplicate(acc, 0.0f, static_cast<int32_t>(chunk));
+        Duplicate(acc2, 0.0f, static_cast<int32_t>(chunk));
+    }
 
     float x0 = 0.0f;
     bool firstTile = true;
@@ -187,23 +206,23 @@ __aicore__ inline void GroupNorm<T>::ProcessGroup(int64_t gidx)
             x0 = fx.GetValue(0);
             firstTile = false;
         }
-        if (cnt < cntR) {
-            // tail lanes read as x0 so the shift makes them contribute 0
-            SetFlag<HardEvent::V_S>(EVENT_ID0);
-            WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            for (int64_t j = cnt; j < cntR; ++j) {
-                fx.SetValue(static_cast<int32_t>(j), x0);
-            }
-            SetFlag<HardEvent::S_V>(EVENT_ID0);
-            WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        }
-        Adds(fx, fx, -x0, static_cast<int32_t>(cntR));
+        // subtract x0 on the real lanes only: the pad lanes are already exactly 0
+        // and stay 0, so the values entering the reduction are bit-identical to
+        // the old "patch the lanes to x0, then subtract" form.
+        Adds(fx, fx, -x0, static_cast<int32_t>(cnt));
         Mul(sq, fx, fx, static_cast<int32_t>(cntR));
-        Add(acc, acc, fx, static_cast<int32_t>(cntR));
-        Add(acc2, acc2, sq, static_cast<int32_t>(cntR));
+        if (!singleTile) {
+            Add(acc, acc, fx, static_cast<int32_t>(cntR));
+            Add(acc2, acc2, sq, static_cast<int32_t>(cntR));
+        }
     }
-    ReduceSum(red, acc, work, static_cast<int32_t>(chunk));
-    ReduceSum(red2, acc2, work2, static_cast<int32_t>(chunk));
+    if (singleTile) {
+        ReduceSum(red, fx, work, static_cast<int32_t>(chunk));
+        ReduceSum(red2, sq, work2, static_cast<int32_t>(chunk));
+    } else {
+        ReduceSum(red, acc, work, static_cast<int32_t>(chunk));
+        ReduceSum(red2, acc2, work2, static_cast<int32_t>(chunk));
+    }
     SetFlag<HardEvent::V_S>(EVENT_ID0);
     WaitFlag<HardEvent::V_S>(EVENT_ID0);
     float s1 = red.GetValue(0);

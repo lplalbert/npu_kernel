@@ -192,6 +192,13 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
         rCap = 1;
     }
 
+    /* minimum row-group size that fills a whole vector lane set: with fewer rows
+     * than this, count is padded to 64 lanes and most lanes are wasted, which is
+     * far more expensive on tiny shapes than using fewer cores. */
+    int64_t rFill = (64 + (wout > 0 ? wout : 1) - 1) / (wout > 0 ? wout : 1);
+    if (rFill < 1) { rFill = 1; }
+    if (rFill > rCap) { rFill = rCap; }
+
     int32_t useScalar = 0;
     int64_t R = 0;
     int64_t rowSpan = 1;
@@ -213,7 +220,7 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
         }
         int64_t total = tileB + accB + wB + extra;
         int64_t groups = n * chIn * CeilDiv<int64_t>(hout, r);
-        bool enoughCores = (groups >= coreNum) || (r == 1);
+        bool enoughCores = (groups >= coreNum) || (r <= rFill);
         if (total <= ubBudget && enoughCores) {
             R = r;
             rowSpan = rs;

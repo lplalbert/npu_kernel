@@ -1,24 +1,26 @@
 /*!
  * \file quant_matmul_sigmoid_mul_quant_tiling_data.h
- * \brief tiling data struct
+ * \brief tiling data for the Matmul(cube) implementation
  */
-
 #ifndef _QUANTMATMULSIGMOIDMULQUANT_TILING_DATA_H_
 #define _QUANTMATMULSIGMOIDMULQUANT_TILING_DATA_H_
 
 #include "kernel_tiling/kernel_tiling.h"
 
-struct QuantMatmulSigmoidMulQuantTilingData {
-    TCubeTiling matmulTiling;
+#pragma pack(push, 8)
+struct alignas(8) QuantMatmulSigmoidMulQuantTilingData {
+    TCubeTiling mm;
     int64_t M = 0;
     int64_t N = 0;
     int64_t K = 0;
     int64_t totalNum = 0;
-    int64_t blockFactor = 1;   // output rows owned by one core
-    int64_t ubFactor = 0;
-    int32_t tileLen = 128;     // N tile (informative)
+    int64_t sysWs = 0;
+    int32_t tileLen = 2048;
     int32_t transA = 0;
     int32_t transB = 0;
-    int64_t usedCores = 1;
+    int32_t gridM = 1;
+    int32_t gridN = 1;
 };
+#pragma pack(pop)
+
 #endif

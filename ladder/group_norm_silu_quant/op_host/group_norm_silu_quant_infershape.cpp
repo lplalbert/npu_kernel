@@ -1,6 +1,6 @@
 /*!
  * \file group_norm_silu_quant_infershape.cpp
- * \brief GroupNormSiluQuant 算子形状推导实现
+ * \brief GroupNormSiluQuant
  */
 
 #include "register/op_impl_registry.h"

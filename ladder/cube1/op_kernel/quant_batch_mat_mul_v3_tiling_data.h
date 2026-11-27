@@ -1,4 +1,4 @@
-/*!
+﻿/*!
  * \file quant_batch_mat_mul_v3_tiling_data.h
  * \brief tiling data for the Matmul(cube) implementation
  */
@@ -21,6 +21,12 @@ struct alignas(8) QuantBatchMatMulV3TilingData {
     int64_t sysWs = 0;   // lib-api workspace bytes that precede the user area
     int32_t gridM = 1;   // number of row tiles of the output grid
     int32_t gridN = 1;   // number of column tiles of the output grid
+    int32_t kc = 0;      // K chunk (0 => single chunk, loop-based fallback)
+    int32_t slowPath = 0; // 1 => use the loop-based Matmul config (leading dim > 65535)
+    int32_t gridK = 1;   // K slices (each core owns one; 1 => M/N grid mode)
+    int32_t needA = 0;   // 1 => stage A K-slice into a compact workspace (orgKa overflows)
+    int32_t needB = 0;   // 1 => stage B K-slice into a compact workspace (orgKb overflows)
+    int32_t np = 0;      // >0 => N-split mode: columns per core (n>65535 case)
 };
 #pragma pack(pop)
 

@@ -1,122 +1,119 @@
-# FlashAttention cube 化（v4）工作记录 / 未解阻塞点
+# FlashAttention v4 (cube) — 2026-11-28 深夜续修记录（未通过，v3 仍为交付）
 
-时间盒内产出：**官方实现结构摘要（见 `REPORT_01_official_impl.md`）** + 可编译可运行可重复 launch 的 cube 版骨架，
-但**尚未通过精度**，因此**不作为交付包**（线上仍应保持 v3 向量版 15/15）。
+> 结论先说：**S=QK^T 的行错乱未修好**（本轮又排掉了 6 种假设，并把根因范围收窄到“cube 的 A 行 / M 维本身”），
+> 按时间盒**停手**。线上/服务器已回滚为 **v3（15/15 Pass，score 10.30，zip md5 97f80d28… 未动）**。本轮**未提交任何改**。
+
+## 0. 机器状态（已回滚，安全）
+- `/root/work/npu_kernel/ladder/zips/flash_attention_7files.zip` md5 = `97f80d28e8b3a93d8df5a259017bae5e`（未改动）
+- `bash /root/work/build_op.sh flash_attention` → BUILD OK / INSTALL OK（从原 zip 重建 v3 并安装到 custom vendor）
+- v3 实测 3/3 PASS（1×2×8×16 f16 causal、1×1×256×64 f32 causal、1×1×1024×72 f32 causal）
+
+## 1. 本轮新修的两个真 bug（保留，价值高）
+### 1.1 workspace 子缓冲区把「大小」当「偏移」用 → S/P/O 完全重叠
+`Init()` 里：
+```
+sGm_.SetGlobalBuffer(ws + core*perCore + t->blkS, ...)   // blkS 是 S 区大小
+pGm_.SetGlobalBuffer(ws + core*perCore + t->blkP, ...)   // blkP 是 P 区大小
+oGm_.SetGlobalBuffer(ws + core*perCore + t->blkO, ...)
+```
+而 host 里 `blkS=AlignUp(s1Base*S*4)`, `blkP=AlignUp(s1Base*S*tsize)`, `blkO=AlignUp(s1Base*D*4)`, `perCore=blkS+blkP+blkO`。
+fp32 时 blkS==blkP==blkO → 三块**基址相同、完全重叠**，S/P/O 互相覆盖（这是“精度全错”的一个独立真 bug）。
+修法（已改）：偏移改累计量——S 在 +0，P 在 +blkS，O 在 +blkS+blkP。
+> 注意：这个 bug **不解释** S 的行重复（debug 只用到 sGm_ 仍错），但它必须修，否则连 S 之外也对不了。
+
+### 1.2 空闲/半截核 End() 死等（dbg 分支）
+原 `if (didWork){ mm1.End(); mm2.End(); }`：若某条路径只跑过 mm1 没跑 mm2（如只做 mm1 的调试分支），
+`mm2.End()` 会 KFC 死等（实测把 910B2 打进 D 状态、`npu-smi` 仍显示 OK 但后续 launch 全挂）。
+修法（已改）：`didM1/didM2` 分别守卫 `mm1.End()/mm2.End()`。
+
+## 2. 对「S 行重复」的定论级新证据（关键，推翻上一轮猜测）
+### 2.1 不是“大 N 单 matmul”的问题
+- S=16/32/64 的单 tile（`baseM=baseN=baseK=64`，usedCore=1，**根本没有 N 分块**）照样错；
+- 逐元素的 A/B 编码实验（q[i,:]=i 常数、k[j]=e0 ⇒ 真值 S[i][j]=i）：
+  - **B(K) 列映射 = 完美恒等**（`got[0][j]=j` 全部 j）；
+  - **A(Q) 行映射** = 错乱 `[9,10,10,12,12,14,14,16,16,...]`。
+- 最终输出（过完 softmax+PV）逐行比对 golden：**out 行 i 恰等于 golden 行 P(i)，64/64 行都能精确对上，列全对**，
+  P = `[9,10,10,12,12,14,14,16,16,18,18,20,20,22,22,24,...]` ≈ `8 + 2*ceil(i/2)`，越界后饱和到 S-1。
+  ⇒ **输出矩阵是 golden 的“纯 M 行置换”（每两行取同一真值行、步进2）**，N/列完全正确。
+  ⇒ 这是 **M 维（A 矩阵行 / L0A 装载）** 的错误，**bmm1 和 bmm2 共享同一行错乱**（所以最终 out 也是这个 P）。
+
+### 2.2 这个行错乱对以下全部“免疫”（逐一实测，结果逐位相同/几乎相同）
+| 变量 | 试过的取值 | 结果 |
+|---|---|---|
+| MatmulConfig | `GetNormalConfig(true)` / `GetNormalConfig()` / `GetMDLConfig()` / `GetNormalConfig(false,false,true)`(isVecND2NZ) | 全错，P 基本不变 |
+| IterateAll | 同步 `IterateAll(gm,false)` / 异步 `IterateAll<false>+WaitIterateAll` / `enSequentialWrite=true` | 全错（**异步+Wait 会 hang，勿用**） |
+| SetOrgShape | 5 参 `(s1Real,s2,D,D,s2)` / 官方式 `(s1Real,D,D,D,s2)` | 全错 |
+| tail/shape | `SetSingleShape(s1,s2,D)` / `SetTail(s1,s2)` | 全错 |
+| 分块/切分 | baseN=16、baseM=16、depthA1=2/depthB1=2 | 全错 |
+| workspace 偏移修复 | 已修 | 行错乱形状不变（只影响 S 之外） |
+
+### 2.3 tiling 本身很“干净”，不像 tiling 问题
+`[FA_TIL mm1] M=64 N=64 Ka=64 Kb=64 scM=64 scN=64 scK=64 baseM=64 baseN=64 baseK=64 depthA1=1/3 depthB1=1 stepM=1 stepN=1 usedCore=1 transLen=0 AL[B=0 S=0 N=0 G=0 D=0] BL[全0]`
+（单 tile、无切分、core=1）。仅 `transLen=0`、`ALayoutInfo*/BLayoutInfo*=0` 值得怀疑（转置 B 的 L1 转置工作区/布局信息可能没被正确设置），但未知其含义。
+
+## 3. 下一轮最短路径（建议，按性价比）
+1. **先做“最小独立 matmul 复现”**：把 `matmul_skeleton`（int8 已验证 bit-exact）原样改成 **A=fp16/fp32 ND、B 转置、C=fp32** 的 [64,64]=[64,64]×[64,64]ᵀ，看是否仍行错乱。
+   - 若错 → 是「fp32/fp16 + transB 的 ND A 装载」在某 tiling 下的库/驱动行为，转去查 `ALayoutInfo*`/`transLength` 语义或换 `MatmulType` 的 LayoutMode。
+   - 若对 → 说明是 FA kernel 的环境（MIX_AIC_1_2、blockDim、UB/TPipe、KFC 注册）干扰，逐个剥离。
+2. **S^T 互换验证**：改算 `Sᵀ = K·Qᵀ`（A=K、B=Qᵀ），若错乱从“行”跑到“列/另一维”，即可定位是 A-load 还是别的。官方算的是 S（A=Q,B=Kᵀ），照官方最稳。
+3. **对齐官方 host tiling**：官方 bmm1 `SetOrgShape(s1RealSize, mm1Kb=D, mm1Ka=D, mm1Kb=D, s2RealSize)` + `SetTail(s1RealSize,s2RealSize)`；关键是其 host tiling 的字段（transLength、layout info、depth 等）由完整 FA tiling 产出，我们的简版可能缺字段。
+4. 之后才是「按 s2 分块（N=128/256）」的流式 + P121 CV 三握手流水（性能向）。
+5. 仍建议：**不要碰 v3**；cube 版精度不过就不打包、不提交。
+
+## 4. 其他踩过的坑（都实测）
+- `IterateAll<false>(...) + WaitIterateAll()` 在本 kernel（MIX_AIC_1_2）会 hang（官方 FA 能用是因为它的同步/流水结构不同）。**本工程用同步 `IterateAll(gm,false)` 即可，勿加 WaitIterateAll。**
+- 用「kernel 里 SetValue 把 tiling 写进 out」的调试路径（dbg=2）曾把设备打进 D 状态；**tiling 直接用 host 侧 `fprintf(stderr)`（`FA_DBG=1` 时）最安全**——注意 driver 只有 rc!=0 才回显 stderr，需自行打印。
+- 设备无 `npu-smi set -t reset`（容器内被禁）；若打进 D 状态只能等/换机。
+
+## 5. 文件
+- v4 WIP 源码：`/tmp/fa_v4/{op_kernel,op_host}`、`/root/work/npu_kernel/ladder/flash_attention_v4cube/`、本地 `fa_probe/v4/`
+- 构建：`/tmp/build_v4.sh`（装到 custom vendor，**不覆盖原 zip**）
+- 测试台：`/tmp/fatest/*`；本轮新增诊断：`diag_s.py`(S dump)、`diag_encode.py`(A行/B列编码)、`diag_out_perm.py`(最终输出行置换)、`diag_tiling.py`
+- 本轮诊断脚本存根：本地 `fa_probe/sh/*.sh|*.py`
 
 ---
 
-## 1. v4 架构（已实现，可编译可跑）
+# §8 2026-11-28 深夜续修（第二次接手）：仍未通，按裁决暂停；v3 安全
 
-对齐官方 `FlashAttentionScoreS1s2Bn2gs1` 的 BNSD 分支，按 P119/P120 裁剪：
+> 状态：**cube 版暂停（lead 裁决）**。线上/服务器保持 **v3（15/15 Pass，score 10.30，zip md5 `97f80d28e8b3a93d8df5a259017bae5e` 未动）**；服务器已 `build_op.sh flash_attention` 重装 v3，实测 3/3 PASS。**未提交、未打 cube 包。**
 
-```
-一个 work block = 某 (b,n) head 的 <=128 个 query 行
-  cube mm1 : S = Q_blk[s1R,D] x K^T(K 存 [S,D], 转置)  -> S[s1R, S] fp32  (GM workspace)
-  vector   : scale / +attn_mask / causal(-1e4) / 精确整行 fp32 softmax -> P(输入 dtype) (GM)
-  cube mm2 : O = P[s1R,S] x V[S,D]                        -> O[s1R, D] fp32   (GM workspace)
-  vector   : cast -> out
-```
-- 7 文件保留原契约（q/k/v/out BNSD、attn_mask (B,1,S,S) 加性、fp16/fp32 同 dtype），host tiling 增加两个 `TCubeTiling`。
-- kernel 入口：非模板 `extern "C" __global__ __aicore__` + `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)` + `REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1, &td->mm1, mm2, &td->mm2)`。
-- 多核：`(B,N,ceil(S/128))` 一维展平，`bi = GetBlockIdx(); bi += GetBlockNum()`。
+## §8.1 ★ S 行重复的「定论级」证据
+用 A/B 编码实验直接解码 cube 的映射（`q[i,:]=i` 常数行、`k[j]=e0` ⇒ 真值 `S[i][j]=q[i][0]=i`）：
+- **B(K) 列映射 = 完美恒等**（`got[0][j]=j`，所有 j）；
+- **A(Q) 行映射 = 错乱** `[9,10,10,12,12,14,14,16,16,18,18,20,20,22,22,24,…]`（≈`8+2·ceil(i/2)`，越界饱和到 S-1）。
+- 最终输出（过完 softmax+PV）逐行比 golden：**out 行 i 精确等于 golden 行 P(i)，64/64 行都能对上、列全对**，P 同上 ≈`8+2·ceil(i/2)`。
+- ⇒ 输出是 golden 的**纯 M 行置换**（每两行取同一真值行、步进 2）；**N/列完全正确**。即 **M 维（A 行 / L0A 装载）错**，bmm1 与 bmm2 共享同一行错乱（所以最终 out 也是这个 P）。
+- 关键点：该现象在 **S=16/32/64 的单 tile**（`baseM=baseN=baseK=64`，usedCore=1，**根本没有 N 分块**）上照样复现 → **推翻上一轮"大 N 单 matmul 回写步长错乱"的猜测**。
 
-## 2. 三条硬坑（都已定位并修复，价值高）
+## §8.2 「已排除清单」（对以下全部免疫：逐一编译实测，结果逐位近同 / 同一 P）
+| 变量 | 试过值 | 结果 |
+|---|---|---|
+| MatmulConfig（4 种） | `GetNormalConfig(true)` / `GetNormalConfig()` / `GetMDLConfig()` / `GetNormalConfig(false,false,true)`(isVecND2NZ) | 全错，P 不变 |
+| IterateAll（同步/异步/顺序） | 同步 `IterateAll(gm,false)` / 异步 `IterateAll<false>+WaitIterateAll` / `enSequentialWrite=true` | 全错（**异步+Wait 会 hang**） |
+| SetOrgShape（5 参两种） | `(s1Real,s2,D,D,s2)` / 官方式 `(s1Real,D,D,D,s2)` | 全错 |
+| tail / shape | `SetSingleShape(s1,s2,D)` / `SetTail(s1,s2)` | 全错 |
+| 分块 / 切分 | `baseN=16`、`baseM=16`、`depthA1=2&depthB1=2` | 全错 |
 
-### 坑1（致命）：`GetUserWorkspace` 被调用两次 → 越界写坏下一 task 的参数区
-entry 已 `GM_ADDR userWS = AscendC::GetUserWorkspace(workspace)` 并传给 `Init`，
-但 `Init` 里又写了一次 `GetUserWorkspace(workspace)`（参数其实已是用户区）→ 所有 workspace 缓冲区整体后移
-`sysWs`（≈16MB），越过 `ws[0]` 申请长度 → **第一次 launch 正常、第二次 launch `aicore exception 0x26` / 507057**
-（正好踩中 `CUBE_MATMUL_ATTEMPT.md` 里"第2次 launch 崩"的表象，但根因不是 KFC 状态，而是越界）。
-→ **修法**：`Init` 内直接把入参当用户区用，不要再 GetUserWorkspace。
+tiling 本身"干净"：`M=N=K=64, baseM=baseN=baseK=64, 单tile, usedCore=1, stepM=stepN=1`；仅 `transLen=0`、`ALayoutInfo*/BLayoutInfo*=0`（转置 B 的 L1 转置工作区/布局信息可能未正确设置）值得怀疑。
 
-### 坑2：空闲核无条件 `mm.End()` → KFC 死等（kernel hang ≈1.6s 后被 watchdog 杀）
-`for (bi = core; bi < totalBlocks; bi += nBlk)` 之外无条件 `mm1.End(); mm2.End();`。
-当 `totalBlocks < GetBlockNum()` 时空闲核没发过 `IterateAll` 却 `End()` → 死锁（表现为每次 launch 约 1.6s、
-输出为未初始化 GM 垃圾、`sync` 超时）。
-→ **修法**：用 `didWork` 标志，只有真正跑过 block 的核才 `End()`。官方 FA 也是"End 只跟在 IterateAll 之后"。
+## §8.3 本轮新修的 2 个「真 bug」（保留在 v4 WIP 源码）
+1. **workspace 子缓冲区把「大小」当「偏移」用 → S/P/O 三块完全重叠**：
+   `Init()` 里 `sGm_/pGm_/oGm_` 的基址分别用了 `t->blkS / t->blkP / t->blkO`，而 host 里这三个是**区间大小**（`perCore=blkS+blkP+blkO`）。fp32 时 `blkS==blkP==blkO` → 三块基址相同、完全重叠、互相覆盖（这是"精度全错"的一个独立真 bug）。
+   修法：偏移改累计量 —— **S@0，P@blkS，O@blkS+blkP**。
+2. **`End()` 死等（KFC 死锁）**：原 `if (didWork){ mm1.End(); mm2.End(); }`，当某分支只跑过 mm1（如只做 mm1 的调试路径）仍调用 `mm2.End()` → KFC 死等，实测把 910B2 打进 **D 态**（`npu-smi` 仍显示 OK，但后续 launch 全挂）。
+   修法：用 `didM1 / didM2` 分别守卫 `mm1.End() / mm2.End()`。
 
-### 坑3：`SoftmaxFlashV2` 的 sum/max 输出布局不是 `row*8`
-CANN 源码 `.../softmax_flashv2_impl/softmax_flashv2_basic_block_impl.h`：
-```
-Brcb(expSumTensor[offset2], tmpBuffer2, splitCeilM, {1, DEFAULT_REPEAT_STRIDE});
-offset2 += tiling.reduceSize;   // 按 rangeM 分组推进
-```
-即 sum 是按 `tiling.reduceSize` 分组的 `Brcb` 广播结果，**步长由 tiling 决定、不是常量 8**。
-我按官方 kernel 的 `sumUb[loopIdx*vec1S1BaseSize*8]` 步长去读，实测拿到的是 `S^r` 这种诡异序列
-（表现为 out = raw(P·V)/l 里 l 呈几何级数）。
-→ **修法**：不用 `SoftmaxFlashV2`，改回原始 `ReduceMax/Adds/Exp/ReduceSum/Muls` 逐行 fp32 softmax
-（与 v3 15/15 的算子组合一致），**并且把 P 归一化后再送 PV**（省掉收尾除法、也天然满足"全 mask 行 l=0→输出0"）。
+## §8.4 血泪坑（务必记住）
+- **`IterateAll<false>(...) + WaitIterateAll()` 在本 kernel（`KERNEL_TYPE_MIX_AIC_1_2`）会 hang**，勿用；用同步 `IterateAll(gm,false)` 即可（官方 FA 能用异步是因为其同步/流水结构不同）。
+- **调试别用 kernel 侧 `SetValue` 把 tiling 写进 out**（会把设备打进 D 态）；**tiling 用 host 侧 `fprintf(stderr)`（`FA_DBG=1` 时）最安全**。注意 driver 只在 `rc!=0` 才回显 stderr，需自行打印。
+- 容器内无 `npu-smi set -t reset`（被禁）；打进 D 态只能等/换机。
 
-修完坑1~3 后，用可控输入验证：
-- `q=k=v=全1` → 输出精确 1.0（PASS）
-- `v=常数0.5、q/k 随机` → 输出精确 0.5（PASS，说明 softmax 归一化 + PV 链路正确）
-- 随机输入 → 仍 FAIL，误差量级与输出同阶
-
-## 3. 未解阻塞点：`mm1` 的 C 输出行出现重复 → S 错
-
-直接 dump QK^T（`FA_DBG=1`，kernel 把 S tile 写进 out）与 numpy `q@k^T` 对比（1×1×64×64 fp32）：
-```
-got[0] = [ 5.428981 -6.101989 12.5927305 3.699233 ...]
-got[1] = [ 4.850824  3.28171  -3.1306207 0.1425114 ...]
-got[2] = [ 4.850824  3.28171  -3.1306207 0.1425114 ...]   <-- 与 got[1] 完全相同
-```
-**got 的第 1、2 行逐位相同**，而真值 gs 各行互不相同。说明 cube 写 C（GM/ND）时行寻址错乱（多行映射到同一源）。
-
-已排除/已试无效：
-1. `S^T`/`NZ(16×16 block)` 两种重排假设 —— 都不匹配；
-2. 给 `sGm_/pGm_/oGm_` 的 `SetGlobalBuffer` 补上显式长度 —— 输出逐位不变；
-3. host `SetBufferSpace(512K,128K)` vs `(-1,-1,-1)` —— 无变化；
-4. `SetFixSplit` 的 baseN 从 S 收到 ≤128（修掉了 D=72 时 `GetWorkspaceSize` 直接失败的问题）；
-5. 核对 `SetOrgShape` 内核侧签名确为 `(orgM, orgN, orgKa, orgKb, orgKc)`，
-   且 `bmm1` 的 `orgKa=orgKb=D`（A 存 (m,k)=[s1,D]，B 存 (n,k)=[S,D] 转置，行 stride 都是 D）—— 与 P117/cube1 一致。
-6. 正在试：`MatmulConfig` 由 `GetMDLConfig(true)` 换成**官方 FA 用的 `GetNormalConfig(true)`**（cube1 的 GEMM 是
-   非转置 B，我这里是转置 B；MDL 档对转置 B 的 ND→L1 路径可能与 Normal 档不同）。
-
-若换成 `GetNormalConfig(true)` 仍不行，下一步建议按 **P117 的完整 host 配方**逐条核对（尤其 `depthA1`、
-`shareMode/shareL1Size/shareL0CSize` 必须写、`SetFixSplit` 只在 d∈(64,128]`），或者干脆改成**按 s2 分块**
-（`N = s2Base*nRatio = 128/256`，与官方一致）而不是现在这样 **一次性 N=S（可达 4096）** 的"大 N 单 matmul"
-—— 后者很可能是 C 行寻址错乱的真正原因（L0C 只 128KB，单次 mm 的 N 远超 L0C，库内部要自行分块，
-其 ND 回写步长可能按 baseN 而非 singleCoreN，导致行重叠）。
-
-## 4. 性能观察（可信度有限）
-
-单次 launch 的 `acltSynchronizeStream` 往返在本机实测约 **870–1050 µs 固定开销**（1×1×8×16 与 1×1×1024×72 几乎一样），
-因此**不能用它评估真实 kernel 时间**；需要 judge 同款的 5 次迭代或用 profiling（`msprof`）取 kernel-only 时间。
-这一点也算一个坑：以后测 FA 性能必须用 kernel-only 口径，否则小 case 全被 ~0.9ms 固定开销淹没。
-
-## 5. 建议
-
-1. **线上保持 v3（15/15）不动**，本次不提交 cube 包。
-2. 下一步最短路径：把 bmm1/bmm2 改成**按 s2 分块**（N=128/256，与官方一致）+ P117 全配方，
-   预期能同时解决 C 行寻址问题并大幅提速；再叠加 P121 的 CV 三握手流水。
-3. 已确认可直接复用的三条经验（踩坑成本很高）：坑1/坑2/坑3 见上。
+## §8.5 下一轮最短路径（若将来再投入）
+1. **最小独立 matmul 复现**：把已验证 bit-exact 的 int8 `matmul_skeleton` 改成 **A=fp16/fp32 ND、B 转置、C=fp32 的 64³**，隔离是「dtype/transB 的 ND A 装载」还是「FA kernel 环境（MIX_AIC_1_2/blockDim/TPipe/KFC 注册）」。
+2. **S^T 互换验证**：改算 `Sᵀ = K·Qᵀ`（A=K、B=Qᵀ），看错乱是否从"行"跑到"列/另一维" → 即可定位是否 A-load。
+3. **对齐官方 host tiling**：对比官方 `detect_flash_attention_score_s1s2_bn2gs1.h` 的 bmm1 `SetOrgShape(s1RealSize,mm1Kb,mm1Ka,mm1Kb,s2RealSize)`+`SetTail`，重点补 `transLength` / `ALayoutInfo*` / `depth` 等字段（我们的简版 host tiling 可能缺）。
+4. 之后才是「按 s2 分块（N=128/256）流式 + P121 CV 三握手流水」（性能向）。
+5. **不碰 v3**；cube 精度不过就不打包、不提交。
 
 ---
-
-## 6. 机器状态：已回滚到 v3，并验证通过（2026-11-27 15:54 UTC / 23:54 CST）
-
-```
-build_op.sh flash_attention  ->  BUILD OK / INSTALL OK   (从原 zip 重建，zip md5 = 97f80d28e8b3a93d8df5a259017bae5e 未改动)
-```
-
-v3（现有交付）在**新服务器 CANN 9.0.0 / 910B** 上 7/7 PASS（torch golden，allclose fp16 1e-3 / fp32 1e-4）：
-
-| case (B,N,S,D, dtype, causal, mask) | max_abs | nbad | 5-rep TOTAL_US |
-|---|---|---|---|
-| 1,2,8,16 fp16 causal | 4.17e-4 | 0/256 | 877 |
-| 2,4,64,64 fp16 causal+mask | 9.49e-4 | 0/32768 | 954 |
-| 1,1,256,128 fp16 noncausal | 2.13e-4 | 0/32768 | 1130 |
-| 1,1,256,64 fp32 causal | 4.77e-7 | 0/16384 | 1126 |
-| 2,2,128,72 fp16 causal+mask | 8.79e-4 | 0/36864 | 1114 |
-| 1,1,512,32 fp32 noncausal+mask | 9.24e-7 | 0/16384 | 1538 |
-| 1,1,1024,72 fp32 causal | 7.15e-7 | 0/73728 | 3392 |
-
-> 注意 TOTAL_US 里含约 **870–880 µs 的 aclnn+stream sync 固定开销**（1×2×8×16 与 1×1×1024×72 的底噪一样），
-> 所以小 case 的数字全是底噪；真实 kernel 时间要用 judge 口径或 msprof 取。上表可用于横向看趋势：
-> 1024×72 fp32 ≈ 3392−880 ≈ 2.5 ms kernel。
-
-## 7. v4 cube 源码位置（WIP，勿提交）
-- 服务器：`/root/work/npu_kernel/ladder/flash_attention_v4cube/{op_kernel,op_host}`
-- 本地：`fa_probe/v4/{op_kernel,op_host}`
-- 构建脚本：`/tmp/build_v4.sh`（不覆盖 ladder/zips 的原包）
-- 诊断开关：`FA_DBG=1` 让 kernel 把 S=QK^T 直接写进 out（配合 `FA_MODE=scheck` 的 driver 比对）
+（本轮完整诊断脚本存根：本地 `fa_probe/sh/`；v4 WIP 源码：`/root/work/npu_kernel/ladder/flash_attention_v4cube/`、`/tmp/fa_v4/`、`fa_probe/v4/`。）

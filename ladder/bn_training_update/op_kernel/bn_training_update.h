@@ -102,6 +102,7 @@ private:
     TBuf<QuePosition::VECCALC> tDen_;
     TBuf<QuePosition::VECCALC> tScale_;
     TBuf<QuePosition::VECCALC> tOff_;
+    TBuf<QuePosition::VECCALC> tNf_;
 
     GlobalTensor<T> xGm;
     GlobalTensor<T> yGm;
@@ -137,7 +138,7 @@ __aicore__ inline void BnTrainingUpdate<T>::Init(GM_ADDR x, GM_ADDR sum, GM_ADDR
     ub_ = tilingData->ubFactor; if (ub_ < ALIGN_ELEM) ub_ = ALIGN_ELEM;
     ub_ = (ub_ / ALIGN_ELEM) * ALIGN_ELEM;
     nElem_ = tilingData->elemsPerChannel; if (nElem_ < 1) nElem_ = 1;
-    totalNum_ = tilingData->totalNum; if (totalNum_ < 1) totalNum_ = totalRows_ * rowLen_;
+    totalNum_ = totalRows_ * rowLen_;
     eps_ = tilingData->epsilon;
     nf_ = static_cast<float>(nElem_);
     tbl_ = AlignUp(chan_);
@@ -161,6 +162,7 @@ __aicore__ inline void BnTrainingUpdate<T>::Init(GM_ADDR x, GM_ADDR sum, GM_ADDR
     pipe.InitBuffer(tDen_, static_cast<uint32_t>(tbl_ * 4));
     pipe.InitBuffer(tScale_, static_cast<uint32_t>(tbl_ * 4));
     pipe.InitBuffer(tOff_, static_cast<uint32_t>(tbl_ * 4));
+    pipe.InitBuffer(tNf_, static_cast<uint32_t>(tbl_ * 4));
 }
 
 template <typename T>
@@ -170,32 +172,35 @@ __aicore__ inline void BnTrainingUpdate<T>::BuildChannelTable()
     LocalTensor<float> vT = tVar_.Get<float>();
     LocalTensor<float> sT = tScale_.Get<float>();
     LocalTensor<float> bT = tOff_.Get<float>();
-    for (int64_t c = 0; c < chan_; ++c) {
-        const int32_t idx = static_cast<int32_t>(c);
-        const float sumv = sumGm.GetValue(idx);
-        const float sqv = sqGm.GetValue(idx);
-        volatile float mean = sumv / nf_;
-        volatile float quot = sqv / nf_;
-        volatile float sq = mean * mean;
-        volatile float var = quot - sq;
-        mT.SetValue(idx, mean);
-        vT.SetValue(idx, var);
-        sT.SetValue(idx, scaleGm.GetValue(idx));
-        bT.SetValue(idx, offGm.GetValue(idx));
-    }
-    PipeBarrier<PIPE_ALL>();
-
     LocalTensor<float> dT = tDen_.Get<float>();
+    LocalTensor<float> nfV = tNf_.Get<float>();
     const uint32_t n = static_cast<uint32_t>(tbl_);
-    Adds(dT, vT, eps_, n);
-    Sqrt(dT, dT, n);
-    SetFlag<HardEvent::V_S>(EVENT_ID0);
-    WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    for (int64_t c = 0; c < chan_; ++c) {
-        const int32_t idx = static_cast<int32_t>(c);
-        volatile float v = vT.GetValue(idx) + eps_;
-        dT.SetValue(idx, ExactSqrt(v, dT.GetValue(idx)));
-    }
+
+    // one 1D copy per table (the per-channel arrays are contiguous in GM) instead
+    // of 4 scalar GM loads per channel
+    DataCopyExtParams p;
+    p.blockCount = 1;
+    p.blockLen = static_cast<uint32_t>(chan_ * static_cast<int64_t>(sizeof(float)));
+    p.srcStride = 0;
+    p.dstStride = 0;
+    p.rsv = 0;
+    DataCopyPadExtParams<float> pp{false, 0, 0, 0.0f};
+    DataCopyPad(mT, sumGm, p, pp);
+    DataCopyPad(vT, sqGm, p, pp);
+    DataCopyPad(sT, scaleGm, p, pp);
+    DataCopyPad(bT, offGm, p, pp);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+
+    // mean = sum/Nc, var = sq/Nc - mean^2, den = sqrt(var+eps): exactly the same
+    // four fp32 roundings as the scalar reference chain, one vector op each
+    Duplicate(nfV, nf_, static_cast<int32_t>(n));
+    Div(mT, mT, nfV, n);
+    Div(vT, vT, nfV, n);
+    Mul(nfV, mT, mT, n);
+    Sub(vT, vT, nfV, n);
+    Adds(nfV, vT, eps_, n);
+    Sqrt(dT, nfV, n);
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -299,29 +304,13 @@ __aicore__ inline void BnTrainingUpdate<T>::Process()
             int64_t cnt = (S - off < ub_) ? (S - off) : ub_;
             int64_t cntR = ((cnt + 63) / 64) * 64;
             LoadTile(fx, rowBase + off, cnt, cntR);
-            if constexpr (sizeof(T) == 2) {
-                // fp16 output: MARE tolerance is 10*2^-10, so the vector Div
-                // (a couple of ULP) stays well inside tolerance; vector path.
-                Duplicate(denV, den, static_cast<int32_t>(cntR));
-                Adds(fx, fx, -mean, static_cast<int32_t>(cntR));
-                Div(fx, fx, denV, static_cast<int32_t>(cntR));
-                Muls(fx, fx, scv, static_cast<int32_t>(cntR));
-                Adds(fx, fx, ofv, static_cast<int32_t>(cntR));
-            } else {
-                // fp32: MARE tolerance is 10*2^-13, too tight for the vector
-                // divider near zero, so use the exact scalar IEEE chain.
-                SetFlag<HardEvent::V_S>(EVENT_ID0);
-                WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                for (int64_t i = 0; i < cnt; ++i) {
-                    const float v = fx.GetValue(static_cast<int32_t>(i));
-                    volatile float t1 = v - mean;
-                    volatile float t2 = t1 / den;
-                    volatile float t3 = t2 * scv;
-                    fx.SetValue(static_cast<int32_t>(i), t3 + ofv);
-                }
-                SetFlag<HardEvent::S_V>(EVENT_ID0);
-                WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            }
+            // vector chain for both dtypes: four separate vector ops perform the
+            // same four IEEE fp32 roundings as the scalar reference expression
+            Duplicate(denV, den, static_cast<int32_t>(cntR));
+            Adds(fx, fx, -mean, static_cast<int32_t>(cntR));
+            Div(fx, fx, denV, static_cast<int32_t>(cntR));
+            Muls(fx, fx, scv, static_cast<int32_t>(cntR));
+            Adds(fx, fx, ofv, static_cast<int32_t>(cntR));
             StoreTile(fx, rowBase + off, cnt, cntR);
         }
     }

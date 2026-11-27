@@ -1,6 +1,6 @@
 /*!
  * \file group_norm_silu_quant_tiling.cpp
- * \brief GroupNormSiluQuant 算子 Tiling 实现
+ * \brief GroupNormSiluQuant  Tiling
  */
 
 #include "register/op_def_registry.h"
@@ -98,6 +98,13 @@ static ge::graphStatus GroupNormSiluQuantTilingFunc(gert::TilingContext* context
         for (size_t i = 0; i < qss.GetDimNum(); ++i) {
             qn *= qss.GetDim(i);
         }
+        // Any other element count would make the kernel read past the tensor
+        // (per-channel access assumes exactly C entries), so reject it here
+        // instead of silently reinterpreting the shape.
+        OP_CHECK_IF(
+            qn != 1 && qn != C,
+            OP_LOGE(context, "quantScale must have 1 or C elements, got %ld (C=%ld)", qn, C),
+            return ge::GRAPH_FAILED);
         if (qn != 1) {
             qsPerChannel = 1;
         }
