@@ -1,0 +1,36 @@
+---
+type: Optimization
+title: "X10: 设备侧分组调度 + NZ plane 权重缓存（Grouped Matmul Cube 化）"
+description: "Grouped matmul（group_list 为 device 端 cumsum）的 Cube 化不要在 host 侧展开分组计划：每个 AIC 核在设备侧自行从 group_list 构建本核的 (group, M-block) 调度（empty group 自然跳过，无 host 同步）；每个专家的 weight 以 NZ plane 形式作为静态缓存放入 GM workspace，tile 排序采用 m-fastest，使多核共享同一 weight strip，weight 流量按 ceil(m_g/baseM) 量级下降；epilogue 放独立 AIV kernel 全向量流水完成。"
+tags:
+  - task.optimization
+  - topic.programming_model.execution_unit.cube
+  - topic.compute.quantization
+status: draft
+sources:
+  - resource: https://gitcode.com/cann/cannbot-knowledge/merge_requests/103
+    role: primary
+created_at: "2026-10-13T00:00:00Z"
+updated_at: "2026-11-03T15:50:00Z"
+platforms:
+  - a2
+---
+# Strategy X10: 设备侧分组调度 + NZ plane 权重缓存（Grouped Matmul Cube 化）
+
+## 核心思路
+Grouped matmul（group_list 为 device 端 cumsum）的 Cube 化不要在 host 侧展开分组计划：每个 AIC 核在设备侧自行从 group_list 构建本核的 (group, M-block) 调度（empty group 自然跳过，无 host 同步）；每个专家的 weight 以 NZ plane 形式作为静态缓存放入 GM workspace，tile 排序采用 m-fastest，使多核共享同一 weight strip，weight 流量从朴素 M×K×N 降到约 ceil(m_g/baseM)×K×N（约 2 个数量级）。epilogue（dequant/激活/再量化）放独立 AIV kernel 全向量流水完成。
+
+## 适用场景
+- GroupedMatmul / MoE 类算子（group_list cumsum 语义、group 大小不均、存在 empty group）
+- 基线为 AIV 向量模拟 matmul、权重零复用的场景（收益为数量级）
+- 需要保持任意 group 分布正确性且不能引入 host-device 同步的场景
+
+## 实现要点
+- AIC kernel：MatmulImpl int8×int8→int32；设备侧读 group_list 建调度；64×256 tile（L0C 双缓冲上限；baseM=128 在 dbL0C=2 溢出、dbL0C=1 结果错，不可用）
+- **fixpipe NZ 写回 n1 步长 = orgM×16 原始值（不对齐 16）**——按 align16 读取会在 orgM≥16 非对齐时每行 col≥16 全错
+- AIV epilogue kernel：TQue 双缓冲流水，NZ 行重组 → fp32 dequant（weight_scale UB 缓存）→ 高层 Silu API（注意非原地安全，内部 Div(dst,src,dst)）→ Max 折叠 absmax → Div 量化 → 队列化 DataCopyPad 输出
+- Host：MatmulApiTiling 建 tiling，GM blob 多槽 ring 传入；cube 不可用（E>64/N>10240 等）时回退 VEC kernel
+
+## 验证方法
+- 在目标算子上做同设备同窗口 A/B（正反序至少两轮），比较父变体与变体；用全量精度门禁与逐 bit/逐元素对比确认语义未变。
+- 容量类改动先做 UB/L1/L0C 预算审计；诊断类改动先做同码 A/A 噪声带。
