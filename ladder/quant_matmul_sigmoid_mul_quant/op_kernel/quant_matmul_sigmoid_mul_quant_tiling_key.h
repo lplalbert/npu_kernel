@@ -1,6 +1,6 @@
 /*!
  * \file quant_matmul_sigmoid_mul_quant_tiling_key.h
- * \brief Tiling 模板参数定义
+ * \brief Tiling
  */
 
 #ifndef __QUANTMATMULSIGMOIDMULQUANT_TILING_KEY_H__

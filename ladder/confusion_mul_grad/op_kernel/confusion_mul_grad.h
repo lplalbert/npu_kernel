@@ -72,6 +72,8 @@ private:
     __aicore__ inline void ProcessRow();
     __aicore__ inline void ProcessRowOld();
     __aicore__ inline void ProcessRowNpu();
+    __aicore__ inline void ProcessRowU4();
+    __aicore__ inline void ProcessRowCascade4();
     __aicore__ inline void ProcessColOld();
     __aicore__ inline void ColGroupOld(int64_t col, int64_t ncols);
     __aicore__ inline void ProcessCol();
@@ -647,6 +649,202 @@ __aicore__ inline void ConfusionMulGrad<T>::ProcessColOld() {
 }
 
 // ---------------------------------------------------------------------------
+// axis=[1] exact torch 2.7.1 (aarch64, Vectorized<float>::size()==4) row sum.
+// Model "U4acc": chunk=4 elements; groups of 4 chunks route chunk 4g+j -> acc[j];
+// leftover chunks (last T%4, T=N/4) go to acc0 lane-wise; partial tail (<4) is
+// left-folded into lane0; per-lane seq combine; horizontal ((s0+s1)+s2)+s3.
+// Verified bit-exact for 5<=N<=287 against torch 2.7.1. Scalar accumulation is
+// used so each add is IEEE; only N<=287 takes this path (bounded work).
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void ConfusionMulGrad<T>::ProcessRowU4() {
+    const int64_t N = t_.N;
+    const int64_t M = t_.M;
+    const int64_t rpc = t_.rowPerCore;
+    int64_t rs = blockIdx_ * rpc;
+    if (rs > M) rs = M;
+    int64_t re = rs + rpc;
+    if (re > M) re = M;
+    if (rs >= re) return;
+
+    LocalTensor<float> pf = tP_.Get<float>();
+    LocalTensor<float> rsB = rsBuf_.Get<float>();
+    int64_t bi = 0;
+    int64_t rowBase = rs;
+    const int64_t cutoff = 16 * (N / 16);   // end of full 16-element groups
+    const int64_t nChunks = N / 4;          // total full chunks
+    const int64_t fourT = 4 * nChunks;      // end of full chunks (== N - N%4)
+    for (int64_t r = rs; r < re; ++r) {
+        const int64_t rowOff = r * N;
+        float a[4][4];
+        for (int j = 0; j < 4; ++j) { for (int l = 0; l < 4; ++l) { a[j][l] = 0.0f; } }
+        float tail = 0.0f;
+        for (int64_t c0 = 0; c0 < N; c0 += tile_) {
+            int64_t cnt = N - c0;
+            if (cnt > tile_) cnt = tile_;
+            const int64_t np = RoundUp64(cnt);
+            LocalTensor<T> t0 = Load1D(q0_, in0Gm_, rowOff + c0, cnt, np);
+            LocalTensor<T> t1 = Load1D(q1_, in1Gm_, rowOff + c0, cnt, np);
+            LocalTensor<T> t2 = Load1D(q2_, in2Gm_, rowOff + c0, cnt, np);
+            LocalTensor<float> aF;
+            LocalTensor<float> bF;
+            LocalTensor<float> cF;
+            Prep(t0, t1, t2, aF, bF, cF, np);
+            LocalTensor<float> oF = GetOF();
+            Mul(oF, aF, bF, static_cast<uint32_t>(np));
+            EmitOut0(oF, rowOff + c0, cnt, np);
+            Mul(pf, bF, cF, static_cast<uint32_t>(np));
+            PipeBarrier<PIPE_ALL>();
+            for (int64_t j = 0; j < cnt; ++j) {
+                int64_t pos = c0 + j;
+                float v = pf.GetValue(static_cast<int32_t>(j));
+                if (pos < cutoff) {
+                    a[(pos >> 2) & 3][pos & 3] += v;
+                } else if (pos < fourT) {
+                    a[0][pos & 3] += v;
+                } else {
+                    if (pos == fourT) { tail = v; } else { tail += v; }
+                }
+            }
+            q0_.FreeTensor(t0);
+            q1_.FreeTensor(t1);
+            q2_.FreeTensor(t2);
+        }
+        float s[4];
+        for (int l = 0; l < 4; ++l) { s[l] = ((a[0][l] + a[1][l]) + a[2][l]) + a[3][l]; }
+        s[0] += tail;
+        float fin = ((s[0] + s[1]) + s[2]) + s[3];
+        rsB.SetValue(static_cast<int32_t>(bi), fin);
+        ++bi;
+        if (bi == ROWSUM_B) {
+            FlushOut1(rsB, rowBase, bi);
+            rowBase += bi;
+            bi = 0;
+        }
+    }
+    if (bi > 0) {
+        FlushOut1(rsB, rowBase, bi);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axis=[1] exact torch CPU `sum(dim=1)` for the LARGE-N regime (N>287).
+// This is torch's cascade_sum base-16 carry structure specialised to
+// Vectorized<float>::size()==4 (aarch64): block = 4 vectors = 16 elements,
+// 4 vector accumulators (level0, 16 lanes), carry into level1 every step0
+// blocks, level2 every step0^2 blocks, level3 every step0^3 blocks; leftover
+// vectors -> lane group 0; trailing scalars summed first; group0 lanes folded
+// last. Verified bit-exact vs torch 2.7.1 for N=4..4096.
+// (kV=4 here, independent of the global kV=8 used by the axis=[0]/[0,1] paths.)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void ConfusionMulGrad<T>::ProcessRowCascade4() {
+    const int64_t N = t_.N;
+    const int64_t M = t_.M;
+    const int64_t rpc = t_.rowPerCore;
+    int64_t rs = blockIdx_ * rpc;
+    if (rs > M) rs = M;
+    int64_t re = rs + rpc;
+    if (re > M) re = M;
+    if (rs >= re) return;
+
+    // cascade_sum specialised to V=4 (block=16 elements, 4 levels x 16 lanes).
+    // Scalar implementation: C++ float arithmetic is IEEE fp32, so each add
+    // rounds identically to torch; this avoids the 16B-alignment / tiny-count
+    // restrictions of vector ops on the 4-lane sub-vectors.
+    const int64_t nvec = N / 4;
+    const int64_t nblocks = nvec / 4;
+    const int64_t tailStart = nblocks * 16;
+    int64_t lp = 4;
+    {
+        int64_t cl = 0;
+        while ((static_cast<int64_t>(1) << cl) < nblocks) { ++cl; }
+        const int64_t t = cl / 4;
+        if (t > lp) lp = t;
+    }
+    const int64_t step0 = static_cast<int64_t>(1) << lp;
+
+    LocalTensor<float> pf = tP_.Get<float>();
+    LocalTensor<float> rsB = rsBuf_.Get<float>();
+    int64_t bi = 0;
+    int64_t rowBase = rs;
+    for (int64_t r = rs; r < re; ++r) {
+        const int64_t rowOff = r * N;
+        float acc[4][16];
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 16; ++l) { acc[j][l] = 0.0f; }
+        }
+        int64_t i = 0;
+        int64_t lastStart = 0;
+        for (int64_t c0 = 0; c0 < N; c0 += tile_) {
+            int64_t cnt = N - c0;
+            if (cnt > tile_) cnt = tile_;
+            const int64_t np = RoundUp64(cnt);
+            LocalTensor<T> t0 = Load1D(q0_, in0Gm_, rowOff + c0, cnt, np);
+            LocalTensor<T> t1 = Load1D(q1_, in1Gm_, rowOff + c0, cnt, np);
+            LocalTensor<T> t2 = Load1D(q2_, in2Gm_, rowOff + c0, cnt, np);
+            LocalTensor<float> aF;
+            LocalTensor<float> bF;
+            LocalTensor<float> cF;
+            Prep(t0, t1, t2, aF, bF, cF, np);
+            LocalTensor<float> oF = GetOF();
+            Mul(oF, aF, bF, static_cast<uint32_t>(np));
+            EmitOut0(oF, rowOff + c0, cnt, np);
+            Mul(pf, bF, cF, static_cast<uint32_t>(np));
+            PipeBarrier<PIPE_ALL>();
+            lastStart = c0;
+            int64_t blk = cnt / 16;
+            const int64_t avail = nblocks - i;
+            if (blk > avail) blk = avail;
+            for (int64_t b = 0; b < blk; ++b) {
+                const int64_t base = b * 16;
+                for (int j = 0; j < 4; ++j) {
+                    for (int l = 0; l < 4; ++l) {
+                        acc[0][j * 4 + l] += pf.GetValue(static_cast<int32_t>(base + j * 4 + l));
+                    }
+                }
+                ++i;
+                if ((i & (step0 - 1)) == 0) {
+                    for (int k = 0; k < 16; ++k) { acc[1][k] += acc[0][k]; acc[0][k] = 0.0f; }
+                    if ((i & (step0 * step0 - 1)) == 0) {
+                        for (int k = 0; k < 16; ++k) { acc[2][k] += acc[1][k]; acc[1][k] = 0.0f; }
+                        if ((i & (step0 * step0 * step0 - 1)) == 0) {
+                            for (int k = 0; k < 16; ++k) { acc[3][k] += acc[2][k]; acc[2][k] = 0.0f; }
+                        }
+                    }
+                }
+            }
+            q0_.FreeTensor(t0);
+            q1_.FreeTensor(t1);
+            q2_.FreeTensor(t2);
+        }
+        for (int k = 0; k < 16; ++k) { acc[0][k] = ((acc[0][k] + acc[1][k]) + acc[2][k]) + acc[3][k]; }
+        for (int64_t a = tailStart; a + 4 <= nvec * 4; a += 4) {
+            const int32_t la = static_cast<int32_t>(a - lastStart);
+            for (int l = 0; l < 4; ++l) { acc[0][l] += pf.GetValue(la + l); }
+        }
+        for (int l = 0; l < 4; ++l) {
+            acc[0][l] = ((acc[0][l] + acc[0][l + 4]) + acc[0][l + 8]) + acc[0][l + 12];
+        }
+        float fin = 0.0f;
+        for (int64_t a = nvec * 4; a < N; ++a) {
+            fin += pf.GetValue(static_cast<int32_t>(a - lastStart));
+        }
+        for (int l = 0; l < 4; ++l) { fin += acc[0][l]; }
+        rsB.SetValue(static_cast<int32_t>(bi), fin);
+        ++bi;
+        if (bi == ROWSUM_B) {
+            FlushOut1(rsB, rowBase, bi);
+            rowBase += bi;
+            bi = 0;
+        }
+    }
+    if (bi > 0) {
+        FlushOut1(rsB, rowBase, bi);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // axis=[1] (mode 0): bit-exact replica of torch CPU `sum(dim=1)`.
 //
 // torch CPU sum uses cascade_sum (aten/src/ATen/native/cpu/SumKernel.cpp):
@@ -677,6 +875,12 @@ __aicore__ inline void ConfusionMulGrad<T>::ProcessRow() {
         ProcessRowOld();
         return;
     }
+    if (t_.N <= 287) {
+        ProcessRowU4();
+        return;
+    }
+    ProcessRowCascade4();
+    return;
     const int64_t N = t_.N;
     const int64_t rpc = t_.rowPerCore;
     int64_t rs = blockIdx_ * rpc;

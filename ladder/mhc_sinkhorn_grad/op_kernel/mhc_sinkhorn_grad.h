@@ -56,6 +56,8 @@ private:
     __aicore__ inline LocalTensor<float> LoadGrad(int64_t t);
     __aicore__ inline void LoadSum(int64_t k, int64_t t);
     __aicore__ inline void BcastRows(LocalTensor<float> dst, LocalTensor<float> src);
+    __aicore__ inline float SumDim1(LocalTensor<float> &p, int64_t r);
+    __aicore__ inline float SumDim2(LocalTensor<float> &p, int64_t c);
     __aicore__ inline void ColNorm(LocalTensor<float> &nt);
     __aicore__ inline void RowNorm(LocalTensor<float> &nt);
     __aicore__ inline void ProcessSample(int64_t t);
@@ -175,23 +177,107 @@ __aicore__ inline void MhcSinkhornGrad::BcastRows(LocalTensor<float> dst, LocalT
     }
 }
 
+// torch 2.7.1 sum(dim=-1) order over a length-n vector x[0..n-1] (n in {4,6,8}):
+//   full Vec4 chunks (rows r, r+4, ... lane-lane), leftover chunks into acc0,
+//   partial tail (<4) LEFT-FOLDED and added to lane0, per-lane seq combine,
+//   horizontal ((s0+s1)+s2)+s3. n<=3 degenerates to plain seq.
+__aicore__ inline float MhcSinkhornGrad::SumDim1(LocalTensor<float> &p, int64_t r) {
+    int64_t n = n_;
+    float a[4][4];
+    for (int j = 0; j < 4; ++j) {
+        for (int l = 0; l < 4; ++l) { a[j][l] = 0.0f; }
+    }
+    int64_t T = n / 4;
+    int64_t g = 0;
+    while (g + 4 <= T) {
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 4; ++l) {
+                a[j][l] = a[j][l] + p.GetValue(static_cast<int32_t>(r * RS + (g + j) * 4 + l));
+            }
+        }
+        g += 4;
+    }
+    for (int64_t t = g; t < T; ++t) {
+        for (int l = 0; l < 4; ++l) {
+            a[0][l] = a[0][l] + p.GetValue(static_cast<int32_t>(r * RS + t * 4 + l));
+        }
+    }
+    float s[4];
+    for (int l = 0; l < 4; ++l) { s[l] = ((a[0][l] + a[1][l]) + a[2][l]) + a[3][l]; }
+    int64_t rem = n - 4 * T;
+    if (rem > 0) {
+        float tail = p.GetValue(static_cast<int32_t>(r * RS + 4 * T));
+        for (int64_t i = 4 * T + 1; i < n; ++i) {
+            tail = tail + p.GetValue(static_cast<int32_t>(r * RS + i));
+        }
+        s[0] = s[0] + tail;
+    }
+    return ((s[0] + s[1]) + s[2]) + s[3];
+}
+
+// torch 2.7.1 sum(dim=-2) order over a length-n column (n in {4,6,8}): identical
+// structure but the partial tail (<4 rows) is added SEQUENTIALLY to lane0 (not folded).
+__aicore__ inline float MhcSinkhornGrad::SumDim2(LocalTensor<float> &p, int64_t c) {
+    int64_t n = n_;
+    float a[4][4];
+    for (int j = 0; j < 4; ++j) {
+        for (int l = 0; l < 4; ++l) { a[j][l] = 0.0f; }
+    }
+    int64_t T = n / 4;
+    int64_t g = 0;
+    while (g + 4 <= T) {
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 4; ++l) {
+                a[j][l] = a[j][l] + p.GetValue(static_cast<int32_t>(((g + j) * 4 + l) * RS + c));
+            }
+        }
+        g += 4;
+    }
+    for (int64_t t = g; t < T; ++t) {
+        for (int l = 0; l < 4; ++l) {
+            a[0][l] = a[0][l] + p.GetValue(static_cast<int32_t>((t * 4 + l) * RS + c));
+        }
+    }
+    float s[4];
+    for (int l = 0; l < 4; ++l) { s[l] = ((a[0][l] + a[1][l]) + a[2][l]) + a[3][l]; }
+    int64_t rem = n - 4 * T;
+    if (rem > 0) {
+        for (int64_t i = 4 * T; i < n; ++i) {
+            s[0] = s[0] + p.GetValue(static_cast<int32_t>(i * RS + c));
+        }
+    }
+    return ((s[0] + s[1]) + s[2]) + s[3];
+}
+
 // Column pass: p = G * norm; colsum = sum over rows; G = (G - colsum) / sum
 __aicore__ inline void MhcSinkhornGrad::ColNorm(LocalTensor<float> &nt) {
     LocalTensor<float> gb = gBuf_.Get<float>();
     LocalTensor<float> p = pBuf_.Get<float>();
     Mul(p, gb, nt, cnt_);
+    PipeBarrier<PIPE_ALL>();
 
     LocalTensor<float> acc = accBuf_.Get<float>();
     Duplicate(acc, 0.0f, static_cast<uint32_t>(RS));
-    for (int64_t r = 0; r < n_; ++r) {
-        Add(acc, acc, p[r * RS], static_cast<uint32_t>(RS));
+    PipeBarrier<PIPE_ALL>();
+    for (int64_t c = 0; c < n_; ++c) {
+        acc.SetValue(static_cast<uint32_t>(c), SumDim2(p, c));
     }
+    PipeBarrier<PIPE_ALL>();
 
     LocalTensor<float> cb = cbBuf_.Get<float>();
     BcastRows(cb, acc);
     Sub(p, gb, cb, cnt_);
-    BcastRows(sbBuf_.Get<float>(), sBuf_.Get<float>());
-    Div(gb, p, sbBuf_.Get<float>(), cnt_);
+    PipeBarrier<PIPE_ALL>();
+    // vector Div is not IEEE round-to-nearest; use scalar division on valid lanes for exactness
+    LocalTensor<float> sbc = sBuf_.Get<float>();
+    for (int64_t r = 0; r < n_; ++r) {
+        for (int64_t c = 0; c < n_; ++c) {
+            float dv = sbc.GetValue(static_cast<int32_t>(c));
+            gb.SetValue(static_cast<uint32_t>(r * RS + c),
+                        p.GetValue(static_cast<int32_t>(r * RS + c)) / dv);
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
     Mul(gb, gb, maskBuf_.Get<float>(), cnt_);
 }
 
@@ -201,17 +287,13 @@ __aicore__ inline void MhcSinkhornGrad::RowNorm(LocalTensor<float> &nt) {
     LocalTensor<float> p = pBuf_.Get<float>();
     Mul(p, gb, nt, cnt_);
 
-    LocalTensor<float> rs = rsBuf_.Get<float>();
-    for (int64_t r = 0; r < n_; ++r) {
-        WholeReduceSum(rs[r * RS], p[r * RS], static_cast<int32_t>(RS), 1, 1, 1, 1);
-    }
     PipeBarrier<PIPE_ALL>();
 
     float rvals[MAX_N];
     float svals[MAX_N];
     LocalTensor<float> sb8 = sBuf_.Get<float>();
     for (int64_t r = 0; r < n_; ++r) {
-        rvals[r] = rs.GetValue(static_cast<int32_t>(r * RS));
+        rvals[r] = SumDim1(p, r);
         svals[r] = sb8.GetValue(static_cast<int32_t>(r));
     }
     PipeBarrier<PIPE_ALL>();
@@ -223,7 +305,15 @@ __aicore__ inline void MhcSinkhornGrad::RowNorm(LocalTensor<float> &nt) {
         Duplicate(sbr[r * RS], svals[r], static_cast<uint32_t>(RS));
     }
     Sub(p, gb, rb, cnt_);
-    Div(gb, p, sbr, cnt_);
+    PipeBarrier<PIPE_ALL>();
+    // scalar IEEE division on valid lanes (vector Div is not correctly rounded)
+    for (int64_t r = 0; r < n_; ++r) {
+        for (int64_t c = 0; c < n_; ++c) {
+            gb.SetValue(static_cast<uint32_t>(r * RS + c),
+                        p.GetValue(static_cast<int32_t>(r * RS + c)) / svals[r]);
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
     Mul(gb, gb, maskBuf_.Get<float>(), cnt_);
 }
 
@@ -338,14 +428,10 @@ __aicore__ inline void MhcSinkhornGrad::ProcessSample(int64_t t) {
     LocalTensor<float> gb = gBuf_.Get<float>();
     LocalTensor<float> p = pBuf_.Get<float>();
     Mul(p, gb, nt0, cnt_);
-    LocalTensor<float> rs = rsBuf_.Get<float>();
-    for (int64_t r = 0; r < n_; ++r) {
-        WholeReduceSum(rs[r * RS], p[r * RS], static_cast<int32_t>(RS), 1, 1, 1, 1);
-    }
     PipeBarrier<PIPE_ALL>();
     float rvals[MAX_N];
     for (int64_t r = 0; r < n_; ++r) {
-        rvals[r] = rs.GetValue(static_cast<int32_t>(r * RS));
+        rvals[r] = SumDim1(p, r);
     }
     PipeBarrier<PIPE_ALL>();
     LocalTensor<float> rb = cbBuf_.Get<float>();
