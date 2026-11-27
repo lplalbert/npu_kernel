@@ -22,8 +22,25 @@ blockDim=24 且大 shape 时，**0~2 次迭代内随机崩（errcode 0x800000400
 **解**：`WaitFlag<M_MTE1>` 之后、`copy_l1_to_l0` 之前插 `PipeBarrier<PIPE_ALL>`（代价约 1.49×）；
 或跨调用续接槽位 + 隔步 PIPE_ALL。
 
-### A4. **`GetUserWorkspace` 在 `Init` 里调用两次** → 越界写到下一个 task 的参数区
-**只调用一次并缓存**。
+### A4. ★★ **`GetUserWorkspace` 在 `Init` 里调用两次 → 这是「第 2 次 launch 崩」的最终真因**
+（ref-fa 实证）entry 已取过用户区，`Init` 里**再调一次** → 所有 workspace 缓冲区**整体后移 ~16MB**
+→ 第 2 次 launch `aicore exception 0x26` / 507057。
+**这不是 KFC 状态问题！之前 perf-cube 试的 7 种方案都白费，就是因为没意识到这条。**
+**对策：`GetUserWorkspace` 全 kernel 只调用一次并缓存指针。**
+
+### A6. **`aclnn + aclrtSynchronizeStream` 有 ~870~880 µs 固定底噪**（ref-fa 实测）
+小 shape 的性能会被底噪完全淹没（`1×2×8×16` 与 `1×1×1024×72` 的 TOTAL_US 底噪一样）。
+**测小算子性能必须用 kernel-only（msprof）或与判题同口径**，否则会误判"没提速"。
+
+### A7. **`SoftmaxFlashV2` 的 sum/max 输出布局不是 `row*8`**
+CANN 源码用 `Brcb(...)` 按 `tiling.reduceSize` 分组写。
+按 `row*8` 读会拿到 `S^r` 这类怪值（表现为 out 呈几何级数）。
+→ **稳妥做法：改用原始 `ReduceMax/Adds/Exp/ReduceSum/Muls` 做逐行 fp32 softmax + P 先归一化再送 PV**。
+
+### A8. **Matmul 写 C（GM/ND）时行寻址错乱的一个高发原因**
+把 bmm1 做成「一次性 N=S（可达 4096）的大 N 单 matmul」时，L0C 只有 128KB，
+单次 N 远超 L0C 会导致库内部分块回写的 **ND 步长按 `baseN` 而非 `singleCoreN`** → 多行映射到同一源（值对、行错）。
+→ **按 s2 分块（N=128/256，与官方一致），C 用 `orgKc=S` + 基址偏移写子块**。
 
 ### A5. 空闲核无条件 `mm.End()` → KFC 死等（hang）
 
