@@ -95,9 +95,10 @@ static ge::graphStatus GroupNormTilingFunc(gert::TilingContext* context)
         tsize = 2;
         schMode = GROUPNORM_TPL_SCH_MODE_2;
     }
-    // UB budget: raw(T) + fbuf(4) + sqb(4) + oraw(T) + work(4) per element
-    int64_t perElem = 2 * tsize + 4 + 4 + 4 + 32;  // + slack
-    int64_t chunkMax = static_cast<int64_t>((ubSize * 55ULL / 100ULL) / static_cast<uint64_t>(perElem));
+    // UB budget (v3 double-buffered): inQ 2*chunk*tsize + outQ 2*chunk*tsize +
+    // fx/sq/acc/acc2/work/work2 6*chunk*4 bytes per element, plus red scratch.
+    int64_t perElem = 2 * tsize * 2 + 6 * 4 + 8;  // ~32 B (fp16) / 40 B (fp32)
+    int64_t chunkMax = static_cast<int64_t>((ubSize * 80ULL / 100ULL) / static_cast<uint64_t>(perElem));
     chunkMax = (chunkMax / 64) * 64;
     if (chunkMax < 64) chunkMax = 64;
     if (chunkMax > 8192) chunkMax = 8192;

@@ -34,11 +34,26 @@ constexpr int GF2P_MAX_ZW = 8;  // max uint64 words for product (2m bits)
 
 // Carryless (GF(2)) multiply: a (nw words) * b (nw words) -> z (2*nw words).
 // 4-bit windowed table method, pure integer / bit operations.
+// z must be zeroed with at least 2*nw + 1 valid words (index 2*nw is scratch).
 __aicore__ inline void Gf2ClMul(const uint64_t* a, const uint64_t* b, int nw, uint64_t* z)
 {
     const int total = 2 * nw;
-    for (int i = 0; i < total; ++i) {
+    for (int i = 0; i <= total; ++i) {
         z[i] = 0ULL;
+    }
+    if (nw == 1 && (a[0] >> 32) == 0ULL && (b[0] >> 32) == 0ULL) {
+        // Both operands < 2^32 (m = 8 or 32). The product fits one word
+        // (a*b < 2^63), so iterate only over the set bits of b.
+        const uint64_t av = a[0];
+        uint64_t bv = b[0];
+        uint64_t acc = 0ULL;
+        while (bv != 0ULL) {
+            const int t = __builtin_ctzll(bv);
+            acc ^= (av << t);
+            bv &= (bv - 1ULL);
+        }
+        z[0] = acc;
+        return;
     }
     const int tw = nw + 1;           // a<<3 can spill into one extra word
     uint64_t tab[16][GF2P_MAX_PW];   // tab[k] = a * k over GF(2), k = 0..15
@@ -69,23 +84,15 @@ __aicore__ inline void Gf2ClMul(const uint64_t* a, const uint64_t* b, int nw, ui
         const int wi = bit >> 6;
         const int sft = bit & 63;
         const uint64_t nib = (b[wi] >> sft) & 0xFULL;
-        for (int w = 0; w < tw; ++w) {
-            uint64_t val = tab[nib][w];
-            if (val == 0ULL) {
-                continue;
+        if (sft == 0) {
+            for (int w = 0; w < tw; ++w) {
+                z[wi + w] ^= tab[nib][w];
             }
-            const int dst = wi + w;
-            if (sft == 0) {
-                if (dst < total) {
-                    z[dst] ^= val;
-                }
-            } else {
-                if (dst < total) {
-                    z[dst] ^= (val << sft);
-                }
-                if (dst + 1 < total) {
-                    z[dst + 1] ^= (val >> (64 - sft));
-                }
+        } else {
+            for (int w = 0; w < tw; ++w) {
+                const uint64_t val = tab[nib][w];
+                z[wi + w] ^= (val << sft);
+                z[wi + w + 1] ^= (val >> (64 - sft));
             }
         }
     }
@@ -159,9 +166,66 @@ __aicore__ inline void Gf2ComputeMu(const uint64_t* P, int pnw, int m, int nw, u
     }
 }
 
+// Build the 4-bit window table tab[k] = C * k (GF(2)) for nibble k, width cw+1 words.
+__aicore__ inline void Gf2BuildWinTab(const uint64_t* c, int cw, uint64_t tab[16][GF2P_MAX_PW])
+{
+    const int tw = cw + 1;
+    for (int w = 0; w < tw; ++w) {
+        tab[0][w] = 0ULL;
+    }
+    uint64_t sh[4][GF2P_MAX_PW];
+    for (int w = 0; w < tw; ++w) {
+        sh[0][w] = (w < cw) ? c[w] : 0ULL;
+    }
+    for (int j = 1; j < 4; ++j) {
+        for (int w = tw - 1; w > 0; --w) {
+            sh[j][w] = (sh[j - 1][w] << 1) | (sh[j - 1][w - 1] >> 63);
+        }
+        sh[j][0] = sh[j - 1][0] << 1;
+    }
+    for (int j = 0; j < 4; ++j) {
+        const int pw = 1 << j;
+        for (int k = 0; k < pw; ++k) {
+            for (int w = 0; w < tw; ++w) {
+                tab[pw + k][w] = tab[k][w] ^ sh[j][w];
+            }
+        }
+    }
+}
+
+// z = x * C using a prebuilt window table tabC (tabC[k] = C*k). z needs 2*nw+1 valid words.
+__aicore__ inline void Gf2MulByTab(const uint64_t* x, int nw, const uint64_t tabC[16][GF2P_MAX_PW],
+                                   uint64_t* z)
+{
+    const int total = 2 * nw;
+    for (int i = 0; i <= total; ++i) {
+        z[i] = 0ULL;
+    }
+    const int tw = nw + 1;
+    const int nibbles = nw * 16;
+    for (int i = 0; i < nibbles; ++i) {
+        const int bit = 4 * i;
+        const int wi = bit >> 6;
+        const int sft = bit & 63;
+        const uint64_t nib = (x[wi] >> sft) & 0xFULL;
+        if (sft == 0) {
+            for (int w = 0; w < tw; ++w) {
+                z[wi + w] ^= tabC[nib][w];
+            }
+        } else {
+            for (int w = 0; w < tw; ++w) {
+                const uint64_t v = tabC[nib][w];
+                z[wi + w] ^= (v << sft);
+                z[wi + w + 1] ^= (v >> (64 - sft));
+            }
+        }
+    }
+}
+
 // Barrett reduction for m multiple of 64: z (2*nw words, deg < 2m) mod P.
 __aicore__ inline void Gf2ReduceBarrett(const uint64_t* z, int nw, const uint64_t* P,
-                                        const uint64_t* muLow, uint64_t* r)
+                                        const uint64_t* muLow, const uint64_t tabMu[16][GF2P_MAX_PW],
+                                        const uint64_t tabP[16][GF2P_MAX_PW], uint64_t* r)
 {
     // q1 = floor(z / x^m)  -> words [nw .. 2nw-1]
     uint64_t q1[GF2P_MAX_NW];
@@ -169,8 +233,8 @@ __aicore__ inline void Gf2ReduceBarrett(const uint64_t* z, int nw, const uint64_
         q1[w] = z[nw + w];
     }
     // q2 = q1 * mu = (q1 << m) ^ clmul(q1, muLow)
-    uint64_t t2[GF2P_MAX_ZW];
-    Gf2ClMul(q1, muLow, nw, t2);
+    uint64_t t2[GF2P_MAX_ZW + 1];
+    Gf2MulByTab(q1, nw, tabMu, t2);
     for (int w = 0; w < nw; ++w) {
         t2[nw + w] ^= q1[w];
     }
@@ -180,14 +244,130 @@ __aicore__ inline void Gf2ReduceBarrett(const uint64_t* z, int nw, const uint64_
         q3[w] = t2[nw + w];
     }
     // q3*P = (q3 << m) ^ clmul(q3, Q)   where Q = P low m bits (== P[0..nw-1])
-    uint64_t t3[GF2P_MAX_ZW];
-    Gf2ClMul(q3, P, nw, t3);
+    uint64_t t3[GF2P_MAX_ZW + 1];
+    Gf2MulByTab(q3, nw, tabP, t3);
     for (int w = 0; w < nw; ++w) {
         t3[nw + w] ^= q3[w];
     }
     // r = low m bits of (z ^ q3*P)
     for (int w = 0; w < nw; ++w) {
         r[w] = z[w] ^ t3[w];
+    }
+}
+
+// ===================== row-parallel vectorized path (uint16 lanes, lane = row) =====================
+// dav_c220 vector Xor/And/Or only support int16/uint16, so words are 16-bit. Layout: for a tile
+// of R rows, word w of every row is a contiguous vector of R uint16 ("word column"); all
+// arithmetic runs lane = row and the per-row gating mask (Muls(bit,-1)) is shared by all words.
+constexpr int GF2P_VEC_R = 512;   // rows per vector tile (multiple of 64)
+
+// dst (nw+1 words) = src (nw words) << off bits, per row. tmp, lm: 1 word scratch each.
+// The carry word uses an explicit low-bit mask so it is correct whether >> is logical or arithmetic.
+__aicore__ inline void VShlWords(const LocalTensor<int16_t>& dst, const LocalTensor<int16_t>& src,
+                                 int nw, int R, uint32_t off, const LocalTensor<int16_t>& tmp,
+                                 const LocalTensor<int16_t>& lm)
+{
+    if (off == 0u) {
+        for (int w = 0; w < nw; ++w) {
+            Adds(dst[w * R], src[w * R], (int16_t)0, R);
+        }
+        Duplicate(dst[nw * R], (int16_t)0, R);
+        return;
+    }
+    Duplicate(lm, (int16_t)((1u << off) - 1u), R);
+    ShiftLeft(dst, src, (int16_t)off, R);
+    for (int w = 1; w < nw; ++w) {
+        ShiftRight(tmp, src[(w - 1) * R], (int16_t)(16 - off), R);
+        And(tmp, tmp, lm, R);
+        ShiftLeft(dst[w * R], src[w * R], (int16_t)off, R);
+        Or(dst[w * R], dst[w * R], tmp, R);
+    }
+    ShiftRight(dst[nw * R], src[(nw - 1) * R], (int16_t)(16 - off), R);
+    And(dst[nw * R], dst[nw * R], lm, R);
+}
+
+// z (2*nw words) = a * b over GF(2), per row, bit-serial over bits of b.
+__aicore__ inline void VClMul(const LocalTensor<int16_t>& a, const LocalTensor<int16_t>& b,
+                              const LocalTensor<int16_t>& z, const LocalTensor<int16_t>& s,
+                              int nw, int R)
+{
+    for (int w = 0; w < 2 * nw; ++w) {
+        Duplicate(z[w * R], (int16_t)0, R);
+    }
+    LocalTensor<int16_t> sh = s;                       // nw+1 words
+    LocalTensor<int16_t> tmp = s[(nw + 1) * R];
+    LocalTensor<int16_t> maskT = s[(nw + 2) * R];
+    LocalTensor<int16_t> tmp2 = s[(nw + 3) * R];
+    LocalTensor<int16_t> lm = s[(nw + 4) * R];
+    LocalTensor<int16_t> onesT = s[(nw + 5) * R];
+    Duplicate(onesT, (int16_t)1, R);
+    const int totalBits = 16 * nw;
+    for (int t = 0; t < totalBits; ++t) {
+        const int bt = t >> 4;
+        const uint32_t off = (uint32_t)(t & 15);
+        if (off == 0u) {
+            Adds(maskT, b[bt * R], (int16_t)0, R);
+        } else {
+            ShiftRight(maskT, b[bt * R], (int16_t)off, R);
+        }
+        And(maskT, maskT, onesT, R);
+        Muls(maskT, maskT, (int16_t)-1, R);
+        VShlWords(sh, a, nw, R, off, tmp, lm);
+        int wmax = 2 * nw - bt;
+        if (wmax > nw + 1) {
+            wmax = nw + 1;
+        }
+        for (int w = 0; w < wmax; ++w) {
+            And(tmp2, sh[w * R], maskT, R);
+            Xor(z[(bt + w) * R], z[(bt + w) * R], tmp2, R);
+        }
+    }
+}
+
+// z (2*nw words) = q (nw words) * C over GF(2), C fixed per core; `bits` = set-bit positions.
+__aicore__ inline void VMulConst(const LocalTensor<int16_t>& z, const LocalTensor<int16_t>& q,
+                                 const LocalTensor<int16_t>& s, int nw, int R,
+                                 const uint16_t* bits, int nbits)
+{
+    for (int w = 0; w < 2 * nw; ++w) {
+        Duplicate(z[w * R], (int16_t)0, R);
+    }
+    LocalTensor<int16_t> sh = s;
+    LocalTensor<int16_t> tmp = s[(nw + 1) * R];
+    LocalTensor<int16_t> lm = s[(nw + 4) * R];
+    for (int k = 0; k < nbits; ++k) {
+        const int j = (int)bits[k];
+        const int bt = j >> 4;
+        const uint32_t off = (uint32_t)(j & 15);
+        VShlWords(sh, q, nw, R, off, tmp, lm);
+        int wmax = 2 * nw - bt;
+        if (wmax > nw + 1) {
+            wmax = nw + 1;
+        }
+        for (int w = 0; w < wmax; ++w) {
+            Xor(z[(bt + w) * R], z[(bt + w) * R], sh[w * R], R);
+        }
+    }
+}
+
+// Barrett reduce in place: input z (2*nw words, deg < 2m), output r in z[0..nw-1].
+__aicore__ inline void VBarrett(const LocalTensor<int16_t>& z, const LocalTensor<int16_t>& s,
+                                const LocalTensor<int16_t>& o, const LocalTensor<int16_t>& tt,
+                                int nw, int R, const uint16_t* muB, int muN,
+                                const uint16_t* pB, int pN)
+{
+    LocalTensor<int16_t> q1 = z[nw * R];
+    VMulConst(o, q1, s, nw, R, muB, muN);
+    for (int w = 0; w < nw; ++w) {
+        Xor(o[(nw + w) * R], o[(nw + w) * R], q1[w * R], R);
+    }
+    LocalTensor<int16_t> q3 = o[nw * R];
+    VMulConst(tt, q3, s, nw, R, pB, pN);
+    for (int w = 0; w < nw; ++w) {
+        Xor(tt[(nw + w) * R], tt[(nw + w) * R], q3[w * R], R);
+    }
+    for (int w = 0; w < nw; ++w) {
+        Xor(z[w * R], z[w * R], tt[w * R], R);
     }
 }
 
@@ -207,6 +387,7 @@ private:
                                       const uint64_t* src, bool aligned8);
     __aicore__ inline void DoTile(int64_t rowStart, int64_t rows, int64_t bytesAB, int64_t bytesT,
                                   int64_t bytesOut);
+    __aicore__ inline void DoTileVec(int64_t rowStart, int64_t rows);
 
 private:
     TPipe pipe;
@@ -222,9 +403,15 @@ private:
     GlobalTensor<uint8_t> tGm;
     GlobalTensor<uint8_t> yGm;
     GlobalTensor<uint8_t> modGm;
+    GlobalTensor<int16_t> aGmU16;
+    GlobalTensor<int16_t> bGmU16;
+    GlobalTensor<int16_t> tGmU16;
+    GlobalTensor<int16_t> yGmU16;
 
     uint64_t P_[GF2P_MAX_PW];
     uint64_t muLow_[GF2P_MAX_NW];
+    uint64_t tabP_[16][GF2P_MAX_PW];
+    uint64_t tabMu_[16][GF2P_MAX_PW];
 
     int64_t totalRows_ = 0;
     int64_t width_ = 1;
@@ -240,6 +427,23 @@ private:
     bool alignT_ = false;   // (2*width_) % 8 == 0
     bool alignOB_ = false;  // outWidth_ % 8 == 0
     bool barrett_ = false;  // use Barrett reduction (m multiple of 64)
+
+    // vectorized row-parallel path (m >= 64, one uint32 lane per row)
+    TBuf<QuePosition::VECCALC> vA;
+    TBuf<QuePosition::VECCALC> vB;
+    TBuf<QuePosition::VECCALC> vZ;
+    TBuf<QuePosition::VECCALC> vO;
+    TBuf<QuePosition::VECCALC> vS;
+    TBuf<QuePosition::VECCALC> vT;
+    TBuf<QuePosition::VECCALC> rawIn;
+    TBuf<QuePosition::VECCALC> rawOut;
+    uint16_t muBits_[256];
+    uint16_t pBits_[256];
+    int muNbits_ = 0;
+    int pNbits_ = 0;
+    int nw16_ = 0;
+    int vR_ = GF2P_VEC_R;
+    bool vec_ = false;
 };
 
 // Copy nBytes from a UB byte tensor starting at byteOff into word array dst.
@@ -330,6 +534,8 @@ __aicore__ inline void Gf2Poly<T>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR t, GM_ADDR
     alignT_ = ((2 * width_) % 8 == 0);
     alignOB_ = (outWidth_ % 8 == 0);
     barrett_ = (m_ >= 64 && (m_ % 64 == 0));
+    // Vector path is validated only for m=256; m=8/32/64/128 use the proven scalar path.
+    vec_ = barrett_ && (m_ == 256) && (width_ == 32);
     tileBytes_ = tileRows_ * width_;
 
     // Declare at least one byte so that empty tensors still get a valid range.
@@ -341,6 +547,10 @@ __aicore__ inline void Gf2Poly<T>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR t, GM_ADDR
     tGm.SetGlobalBuffer((__gm__ uint8_t*)t, tBytesGm);
     yGm.SetGlobalBuffer((__gm__ uint8_t*)y, yBytesGm);
     modGm.SetGlobalBuffer((__gm__ uint8_t*)mod_poly, width_ + 1);
+    aGmU16.SetGlobalBuffer((__gm__ int16_t*)a, abBytesGm / 2 > 0 ? abBytesGm / 2 : 1);
+    bGmU16.SetGlobalBuffer((__gm__ int16_t*)b, abBytesGm / 2 > 0 ? abBytesGm / 2 : 1);
+    tGmU16.SetGlobalBuffer((__gm__ int16_t*)t, tBytesGm / 2 > 0 ? tBytesGm / 2 : 1);
+    yGmU16.SetGlobalBuffer((__gm__ int16_t*)y, yBytesGm / 2 > 0 ? yBytesGm / 2 : 1);
 
     const uint32_t abBytes = (uint32_t)(((tileBytes_) + 31) / 32 * 32);
     const uint32_t tBytes = (uint32_t)(((tileRows_ * 2 * width_) + 31) / 32 * 32);
@@ -350,6 +560,26 @@ __aicore__ inline void Gf2Poly<T>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR t, GM_ADDR
     pipe.InitBuffer(tBuf, tBytes);
     pipe.InitBuffer(outBuf, oBytes);
     pipe.InitBuffer(modBuf, (uint32_t)(((width_ + 1) + 31) / 32 * 32));
+
+    if (vec_) {
+        nw16_ = (int)(width_ / 2);
+        // rows-per-tile from a ~130KB budget: vector (9*nw16+4 words/row) + rawIn/rawOut (4*nw16).
+        const uint32_t bytesPerRow = (uint32_t)((13 * nw16_ + 4) * 2);
+        int R = (int)((130u * 1024u) / bytesPerRow);
+        if (R > 1024) R = 1024;
+        if (R < 256) R = 256;
+        R = (R / 64) * 64;
+        vR_ = R;
+        const uint32_t RR = (uint32_t)vR_;
+        pipe.InitBuffer(vA, (uint32_t)nw16_ * RR * 2u);
+        pipe.InitBuffer(vB, (uint32_t)nw16_ * RR * 2u);
+        pipe.InitBuffer(vZ, (uint32_t)(2 * nw16_) * RR * 2u);
+        pipe.InitBuffer(vO, (uint32_t)(2 * nw16_) * RR * 2u);
+        pipe.InitBuffer(vT, (uint32_t)(2 * nw16_) * RR * 2u);
+        pipe.InitBuffer(vS, (uint32_t)(nw16_ + 6) * RR * 2u);
+        pipe.InitBuffer(rawIn, (uint32_t)(2 * nw16_) * RR * 2u);
+        pipe.InitBuffer(rawOut, (uint32_t)(2 * nw16_) * RR * 2u);
+    }
 
     // Load mod_poly once per core and build the modulus words P_.
     LocalTensor<uint8_t> pm = modBuf.Get<uint8_t>();
@@ -374,6 +604,25 @@ __aicore__ inline void Gf2Poly<T>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR t, GM_ADDR
     }
     if (barrett_) {
         Gf2ComputeMu(P_, pnw_, (int)m_, nw_, muLow_);
+        Gf2BuildWinTab(muLow_, nw_, tabMu_);
+        Gf2BuildWinTab(P_, nw_, tabP_);
+    }
+    if (vec_) {
+        // 16-bit views of muLow_ and P_ (low nw16_ words) + set-bit position lists.
+        muNbits_ = 0;
+        pNbits_ = 0;
+        for (int j = 0; j < 16 * nw16_; ++j) {
+            const int w = j >> 4;
+            const int b = j & 15;
+            const uint32_t mw = (uint32_t)((muLow_[w >> 2] >> (16 * (w & 3))) & 0xFFFFull);
+            const uint32_t pw = (uint32_t)((P_[w >> 2] >> (16 * (w & 3))) & 0xFFFFull);
+            if ((mw >> b) & 1u) {
+                muBits_[muNbits_++] = (int16_t)j;
+            }
+            if ((pw >> b) & 1u) {
+                pBits_[pNbits_++] = (int16_t)j;
+            }
+        }
     }
     PipeBarrier<PIPE_ALL>();
 }
@@ -413,11 +662,11 @@ __aicore__ inline void Gf2Poly<T>::DoTile(int64_t rowStart, int64_t rows, int64_
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 
     for (int64_t i = 0; i < rows; ++i) {
-        uint64_t z[GF2P_MAX_ZW];
-        for (int w = 0; w < 2 * nw_; ++w) {
-            z[w] = 0ULL;
-        }
+        uint64_t z[GF2P_MAX_ZW + 1];
         if (mode_ == 1) {
+            for (int w = 0; w <= 2 * nw_; ++w) {
+                z[w] = 0ULL;
+            }
             LoadWords(inT, i * 2 * width_, (int)(2 * width_), z, alignT_);
         } else {
             uint64_t aw[GF2P_MAX_NW];
@@ -431,7 +680,7 @@ __aicore__ inline void Gf2Poly<T>::DoTile(int64_t rowStart, int64_t rows, int64_
         } else {
             uint64_t r[GF2P_MAX_NW];
             if (barrett_) {
-                Gf2ReduceBarrett(z, nw_, P_, muLow_, r);
+                Gf2ReduceBarrett(z, nw_, P_, muLow_, tabMu_, tabP_, r);
             } else {
                 Gf2Reduce(z, nw_, P_, pnw_, (int)m_, r);
             }
@@ -455,6 +704,97 @@ __aicore__ inline void Gf2Poly<T>::DoTile(int64_t rowStart, int64_t rows, int64_
 }
 
 template <typename T>
+__aicore__ inline void Gf2Poly<T>::DoTileVec(int64_t rowStart, int64_t rows)
+{
+    const int nw = nw16_;
+    const int R = vR_;
+    const uint32_t nv = (uint32_t)rows;
+    const int64_t W = width_;
+    const int64_t outW = outWidth_;
+
+    LocalTensor<int16_t> a = vA.Get<int16_t>();
+    LocalTensor<int16_t> b = vB.Get<int16_t>();
+    LocalTensor<int16_t> z = vZ.Get<int16_t>();
+    LocalTensor<int16_t> o = vO.Get<int16_t>();
+    LocalTensor<int16_t> s = vS.Get<int16_t>();
+    LocalTensor<int16_t> tt = vT.Get<int16_t>();
+    LocalTensor<int16_t> rawI = rawIn.Get<int16_t>();
+    LocalTensor<int16_t> rawO = rawOut.Get<int16_t>();
+
+    // ---- loads: one contiguous DMA per operand, then scalar deinterleave into word columns ----
+    if (mode_ == 1) {
+        DataCopyExtParams p;
+        p.blockCount = 1;
+        p.blockLen = (uint32_t)(nv * (uint32_t)(2 * W));
+        p.srcStride = 0;
+        p.dstStride = 0;
+        p.rsv = 0;
+        DataCopyPad(rawI, tGmU16[rowStart * (2 * nw)], p, DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+        PipeBarrier<PIPE_ALL>();
+        for (uint32_t r = 0; r < nv; ++r) {
+            const uint32_t base = r * (uint32_t)(2 * nw);
+            for (int w = 0; w < 2 * nw; ++w) {
+                z.SetValue((uint32_t)(w * R) + r, rawI.GetValue(base + (uint32_t)w));
+            }
+        }
+    } else {
+        for (int pass = 0; pass < 2; ++pass) {
+            DataCopyExtParams p;
+            p.blockCount = 1;
+            p.blockLen = (uint32_t)(nv * (uint32_t)W);
+            p.srcStride = 0;
+            p.dstStride = 0;
+            p.rsv = 0;
+            if (pass == 0) {
+                DataCopyPad(rawI, aGmU16[rowStart * nw], p, DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+            } else {
+                DataCopyPad(rawI, bGmU16[rowStart * nw], p, DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+            }
+            PipeBarrier<PIPE_ALL>();
+            for (uint32_t r = 0; r < nv; ++r) {
+                const uint32_t base = r * (uint32_t)nw;
+                if (pass == 0) {
+                    for (int w = 0; w < nw; ++w) {
+                        a.SetValue((uint32_t)(w * R) + r, rawI.GetValue(base + (uint32_t)w));
+                    }
+                } else {
+                    for (int w = 0; w < nw; ++w) {
+                        b.SetValue((uint32_t)(w * R) + r, rawI.GetValue(base + (uint32_t)w));
+                    }
+                }
+            }
+            PipeBarrier<PIPE_ALL>();
+        }
+    }
+
+    if (mode_ != 1) {
+        VClMul(a, b, z, s, nw, R);
+    }
+    if (mode_ != 0) {
+        VBarrett(z, s, o, tt, nw, R, muBits_, muNbits_, pBits_, pNbits_);
+    }
+
+    // ---- store: scalar gather into a contiguous buffer, then one DMA out ----
+    const int ow = (mode_ == 0) ? (2 * nw) : nw;
+    for (uint32_t r = 0; r < nv; ++r) {
+        const uint32_t base = r * (uint32_t)ow;
+        for (int w = 0; w < ow; ++w) {
+            rawO.SetValue(base + (uint32_t)w, z.GetValue((uint32_t)(w * R) + r));
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
+
+    DataCopyExtParams po;
+    po.blockCount = 1;
+    po.blockLen = (uint32_t)(nv * (uint32_t)outW);
+    po.srcStride = 0;
+    po.dstStride = 0;
+    po.rsv = 0;
+    DataCopyPad(yGmU16[rowStart * ow], rawO, po);
+    PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
 __aicore__ inline void Gf2Poly<T>::Process()
 {
     const int64_t blockId = (int64_t)GetBlockIdx();
@@ -468,6 +808,12 @@ __aicore__ inline void Gf2Poly<T>::Process()
     }
 
     int64_t r = startRow;
+    if (vec_) {
+        while (endRow - r >= (int64_t)vR_) {
+            DoTileVec(r, (int64_t)vR_);
+            r += vR_;
+        }
+    }
     while (r < endRow) {
         int64_t rows = endRow - r;
         if (rows > tileRows_) {

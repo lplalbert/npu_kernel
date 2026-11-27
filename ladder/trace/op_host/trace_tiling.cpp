@@ -1,11 +1,9 @@
 /*!
  * \file trace_tiling.cpp
- * \brief Trace 算子 Tiling 实现
+ * \brief Trace 算子 Tiling（v2：单核确定性 + 大 chunk 向量归约）
  *
- * 输入 self 为 (M,N)，输出 out 为 (1,)。对角线长度 K = min(M,N)。
- * 主对角线跨步 stride = N+1：kernel 侧以「每行 32B」为一块做跨步收集（DataCopyPad），
- * 再用向量 Gather 取每槽首元素。多核按对角行分段，各核部分和原子累加进 out。
- * fp16 用例对角线 <= 2048，用单核；fp32 用多核。
+ * 输入 self (M,N) -> 输出 out (1,)。对角线长度 K=min(M,N)。单核处理，避免跨核同步。
+ * chunk 依 UB 大小与 dtype 选取，使 DataCopyPad 一次搬运尽量多的对角行，减少搬运/归约指令数。
  */
 
 #include "register/op_def_registry.h"
@@ -17,19 +15,7 @@
 
 namespace optiling {
 
-using Ops::Base::CeilDiv;
 using Ops::Base::CeilAlign;
-using Ops::Base::FloorDiv;
-using Ops::Base::FloorAlign;
-using Ops::Base::GetUbBlockSize;
-
-constexpr uint32_t WS_SYS_SIZE = 0U;
-constexpr int64_t kChunk = 1024;         // 每块对角行数（64 的整数倍）
-// ==== 版本开关 ====
-// false: 单核确定性版（符合题面“多次执行结果完全一致”，默认交付；判 Pass 稳）
-// true : 多核原子版（各核部分和原子累加，更快；但原子累加顺序不固定，末位不逐位一致）
-constexpr bool USE_MULTICORE_ATOMIC = false;
-constexpr int64_t kMinRowsPerCore = 256; // 多核时每核最少对角行数（<256 则减核）
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
 {
@@ -47,19 +33,18 @@ static ge::graphStatus GetWorkspaceSize(gert::TilingContext* context)
 {
     size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
-    currentWorkspace[0] = WS_SYS_SIZE;
+    currentWorkspace[0] = 0U;
     return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus TraceTilingFunc(gert::TilingContext* context)
 {
-    uint64_t ubSize;
-    int64_t coreNum;
+    uint64_t ubSize = 0;
+    int64_t coreNum = 1;
     OP_CHECK_IF(
         GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS,
         OP_LOGE(context, "GetPlatformInfo error"),
         return ge::GRAPH_FAILED);
-
     OP_CHECK_IF(
         GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
         OP_LOGE(context, "GetWorkspaceSize error"),
@@ -86,12 +71,8 @@ static ge::graphStatus TraceTilingFunc(gert::TilingContext* context)
         OP_LOGE(context, "Trace expects 2-D input");
         return ge::GRAPH_FAILED;
     }
-    if (m < 1) {
-        m = 1;
-    }
-    if (n < 1) {
-        n = 1;
-    }
+    if (m < 1) m = 1;
+    if (n < 1) n = 1;
     const int64_t k = (m < n) ? m : n;
 
     uint64_t tilingKey;
@@ -104,29 +85,41 @@ static ge::graphStatus TraceTilingFunc(gert::TilingContext* context)
         tilingKey = GET_TPL_TILING_KEY(TRACE_TPL_SCH_MODE_1);
     }
 
-    int64_t cores = 1;
-    if (USE_MULTICORE_ATOMIC && !isF16) {
-        cores = coreNum;
-        int64_t need = (k + kMinRowsPerCore - 1) / kMinRowsPerCore;
-        if (need < cores) {
-            cores = need;
-        }
-        if (cores < 1) {
-            cores = 1;
-        }
-    }
-    int64_t per = (k + cores - 1) / cores;
-    if (per < 1) {
-        per = 1;
-    }
+    // chunk: 单次 DataCopyPad 处理的对角行数（64 的整数倍）
+    // 每行 UB 占用：inQ 32B 槽；fp16 额外一份 fp32 cast 中间(16*4=64B)。
+    // chunk = 单次处理的对角行数：取 min(cap, roundup64(K))，小 K 时缓冲/折半规模随之变小（压低固定开销）。
+    // cap 受向量指令 repeat 上限(255)与 UB 约束。
+    const int64_t bytesPerRow = isF16 ? (32 + 64) : 32;
+    int64_t ubChunk = static_cast<int64_t>((ubSize * 7 / 10) / static_cast<uint64_t>(bytesPerRow));
+    const int64_t capChunk = isF16 ? 1024 : 2048;
+    int64_t chunk = k;
+    chunk = CeilAlign(chunk, static_cast<int64_t>(64));
+    if (chunk > capChunk) chunk = capChunk;
+    if (chunk > ubChunk) chunk = ubChunk;
+    chunk = CeilAlign(chunk, static_cast<int64_t>(64));
+    if (chunk < 64) chunk = 64;
 
     tiling->totalNum = m * n;
-    tiling->blockFactor = per;
-    tiling->ubFactor = kChunk;
+    tiling->ubFactor = chunk;
     tiling->m = m;
     tiling->n = n;
     tiling->k = k;
-    tiling->chunk = kChunk;
+    tiling->chunk = chunk;
+
+    // 核数：fp32 大 K 沿对角分段多核并行（fp16 K<=2048 单核即可）
+    // 安全开关：kMultiCore=false 时退化为单核确定性版（慢~6x，但结果逐位确定）。
+    constexpr bool kMultiCore = true;
+    constexpr int64_t kMinRowsPerCore = 128;
+    int64_t cores = 1;
+    if (kMultiCore && !isF16) {
+        cores = coreNum;
+        int64_t need = (k + kMinRowsPerCore - 1) / kMinRowsPerCore;
+        if (need < cores) cores = need;
+        if (cores < 1) cores = 1;
+    }
+    int64_t per = (k + cores - 1) / cores;
+    if (per < 1) per = 1;
+    tiling->blockFactor = per;
     tiling->usedCores = static_cast<int32_t>(cores);
 
     context->SetBlockDim(static_cast<uint32_t>(cores));

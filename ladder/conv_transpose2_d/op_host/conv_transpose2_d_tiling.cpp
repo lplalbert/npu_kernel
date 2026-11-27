@@ -149,33 +149,103 @@ static ge::graphStatus ConvTranspose2DTilingFunc(gert::TilingContext* context)
     bool isF16 = (inputDesc != nullptr &&
                   (inputDesc->GetDataType() == ge::DT_FLOAT16 || inputDesc->GetDataType() == ge::DT_BF16));
 
-    // Decide ow-block vector vs scalar path by UB budget.
+    // Decide vector vs scalar path by UB budget.
     int64_t woutPad = ((wout + 63) / 64) * 64;
     if (woutPad < 64) {
         woutPad = 64;
     }
-    int64_t wb = woutPad < 256 ? woutPad : 256;
-    if (wb < 64) {
-        wb = 64;
-    }
-    int64_t accSize = ((woutPad + wb - 1) / wb) * wb;
-    int64_t p2 = ((win + 64 + 63) / 64) * 64;
+    int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;  // bytes
+    int64_t p2Row = ((win + 64 + 63) / 64) * 64;                 // whole x-row buffer (floats)
+
+    auto pickWb = [](int64_t a) -> int64_t {
+        if (a >= 256 && (a % 256) == 0) {
+            return 256;
+        }
+        if (a >= 128 && (a % 128) == 0) {
+            return 128;
+        }
+        return 64;
+    };
     // UB footprint of the vector path, in fp32 slots, mirroring what the kernel
     // allocates: row accumulator, per-kw gather table (int32), gathered block,
-    // x row, plus the fp16 staging buffers when the io dtype is fp16.
-    int64_t f16Floats = isF16 ? ((accSize + p2) / 2) : 0;
-    int64_t commonFloats = accSize + kw * accSize + wb + p2 + f16Floats;
-    // accMode 2: one accumulator per (kh,kw) tap -> reference reduction order
-    int64_t tapFloats = commonFloats + kh * kw * accSize;
-    // accMode 1: one (ci,kh) chunk accumulator + Kahan compensation row
-    int64_t kahanFloats = commonFloats + 2 * accSize + 2 * wb;
-    // accMode 0: one (ci,kh) chunk accumulator
-    int64_t plainFloats = commonFloats + accSize;
-    int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
+    // x buffer, plus the fp16 staging buffers when the io dtype is fp16.
+    auto commonFloatsOf = [&](int64_t a, int64_t w, int64_t xbuf) -> int64_t {
+        int64_t f16 = isF16 ? ((a + xbuf) / 2) : 0;
+        return a + kw * a + w + xbuf + f16;
+    };
+
     int32_t useScalar = 1;
     int32_t accMode = 0;
-    if (wout >= 1 && rowsTotal >= 1 && commonFloats * 4 <= ubBudget) {
-        useScalar = 0;
+    int32_t winSeg = 0;
+    int64_t owBlockSize = 0;
+    int64_t wbSize = 0;
+    int64_t winSegSize = 0;
+
+    if (wout >= 1 && rowsTotal >= 1) {
+        // Fast path: whole padded output row AND whole x row fit in UB -> keep
+        // the historical single-block tiling (bit-identical for shapes that
+        // already worked).
+        int64_t wbRow = woutPad < 256 ? woutPad : 256;
+        if (wbRow < 64) {
+            wbRow = 64;
+        }
+        int64_t accRow = ((woutPad + wbRow - 1) / wbRow) * wbRow;
+        if (commonFloatsOf(accRow, wbRow, p2Row) * 4 <= ubBudget) {
+            useScalar = 0;
+            owBlockSize = accRow;
+            wbSize = wbRow;
+        } else {
+            // Segmented path: split the output width into <=4096 blocks AND load
+            // only the needed slice of the x row per block, so the row
+            // accumulator and the x buffer both stay small regardless of
+            // wout/win.  This keeps the per-tap reference accumulation order.
+            int64_t cap = woutPad < 4096 ? woutPad : 4096;
+            int64_t bestExact = 0;  // largest block that fits per-tap (accMode 2)
+            int64_t bestAny = 0;    // largest block that fits at least accMode 3
+            int64_t bestSeg = 0;
+            for (int64_t a = cap; a >= 64; a -= 64) {
+                int64_t segLenMax = ((a - 1) + (kw - 1) * dil) / stride + 1;
+                if (segLenMax < 1) {
+                    segLenMax = 1;
+                }
+                int64_t segP2 = ((segLenMax + 63) / 64) * 64;
+                int64_t w = pickWb(a);
+                int64_t common = commonFloatsOf(a, w, segP2 + 64);
+                if (bestAny == 0 && common * 4 <= ubBudget) {
+                    bestAny = a;
+                    bestSeg = segP2;
+                }
+                if (bestExact == 0 && (common + kh * kw * a) * 4 <= ubBudget) {
+                    bestExact = a;
+                }
+                if (bestExact != 0 && bestAny != 0) {
+                    break;
+                }
+            }
+            if (bestExact != 0) {
+                bestAny = bestExact;
+                int64_t segLenMax = ((bestExact - 1) + (kw - 1) * dil) / stride + 1;
+                if (segLenMax < 1) {
+                    segLenMax = 1;
+                }
+                bestSeg = ((segLenMax + 63) / 64) * 64;
+            }
+            if (bestAny != 0) {
+                useScalar = 0;
+                winSeg = 1;
+                owBlockSize = bestAny;
+                wbSize = pickWb(bestAny);
+                winSegSize = bestSeg;
+            }
+        }
+    }
+
+    if (useScalar == 0) {
+        int64_t xbuf = (winSeg != 0) ? (winSegSize + 64) : p2Row;
+        int64_t commonFloats = commonFloatsOf(owBlockSize, wbSize, xbuf);
+        int64_t tapFloats = commonFloats + kh * kw * owBlockSize;
+        int64_t kahanFloats = commonFloats + 2 * owBlockSize + 2 * wbSize;
+        int64_t plainFloats = commonFloats + owBlockSize;
         if (tapFloats * 4 <= ubBudget) {
             accMode = 2;
         } else if (kahanFloats * 4 <= ubBudget) {
@@ -244,6 +314,10 @@ static ge::graphStatus ConvTranspose2DTilingFunc(gert::TilingContext* context)
     tiling->usedCores = static_cast<int32_t>(usedCores);
     tiling->useScalar = useScalar;
     tiling->accMode = accMode;
+    tiling->owBlockSize = owBlockSize;
+    tiling->wbSize = wbSize;
+    tiling->winSeg = winSeg;
+    tiling->winSegSize = winSegSize;
 
     context->SetBlockDim(static_cast<uint32_t>(usedCores));
 

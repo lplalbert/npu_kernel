@@ -26,7 +26,7 @@ namespace optiling {
 using Ops::Base::CeilDiv;
 
 constexpr uint32_t WS_SYS_SIZE = 0U;
-constexpr int64_t TARGET_TILE_BYTES = 8192;
+constexpr int64_t TARGET_TILE_BYTES = 16384;
 constexpr int64_t MAX_ROWS = 1LL << 20;
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
@@ -155,7 +155,7 @@ static ge::graphStatus Gf2PolyTilingFunc(gert::TilingContext* context)
     if (limit < 32) {
         limit = 32;
     }
-    int64_t tileBytes = TARGET_TILE_BYTES;
+    int64_t tileBytes = (mVal == 256) ? 4096 : TARGET_TILE_BYTES;
     if (tileBytes > limit) {
         tileBytes = limit;
     }

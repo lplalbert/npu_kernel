@@ -1,163 +1,127 @@
 /*!
  * \file quant_batch_mat_mul_v3_tiling.cpp
- * \brief QuantBatchMatMulV3 operator Tiling implementation
- *
- * The kernel evaluates the int8 product on the vector unit with one output row
- * block per core, so the tiling only has to publish the two dimensional problem
- * geometry (m, n, k), the transpose combination and the number of rows per core.
- * The last dimension of x1 / x2 is never assumed to be bounded, so a k or n above
- * 65535 needs no special handling here.
+ * \brief host tiling: Matmul(cube) tiling for an explicit per-core output grid.
  */
-
 #include "register/op_def_registry.h"
 #include "op_common/log/log.h"
-#include "op_common/op_host/util/math_util.h"
-#include "op_common/op_host/util/platform_util.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling_api.h"
+#include <cstdio>
+#include <cstdlib>
 #include "../op_kernel/quant_batch_mat_mul_v3_tiling_data.h"
 #include "../op_kernel/quant_batch_mat_mul_v3_tiling_key.h"
 
 namespace optiling {
 
-using Ops::Base::CeilDiv;
-using Ops::Base::CeilAlign;
-using Ops::Base::FloorDiv;
-using Ops::Base::FloorAlign;
-using Ops::Base::GetUbBlockSize;
-
-constexpr uint32_t WS_SYS_SIZE = 0U;
-constexpr int64_t TYPE_SIZE = 4;
-constexpr int64_t MIN_SPLIT_THRESHOLD = 1024;
-
-static const gert::Shape g_vec_1_shape = {1};
-
-static inline const gert::Shape EnsureNotScalar(const gert::Shape& in_shape) {
-    if (in_shape.GetDimNum() == 0) {
-        return g_vec_1_shape;
-    }
-    return in_shape;
-}
-
-static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
-{
-    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
-    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
-    coreNum = ascendcPlatform.GetCoreNumAiv();
-    OP_CHECK_IF(coreNum == 0, OP_LOGE(context, "coreNum is 0"), return ge::GRAPH_FAILED);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-    OP_CHECK_IF(ubSize == 0, OP_LOGE(context, "ubSize is 0"), return ge::GRAPH_FAILED);
-    return ge::GRAPH_SUCCESS;
-}
-
-static ge::graphStatus GetWorkspaceSize(gert::TilingContext* context)
-{
-    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
-    OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
-    currentWorkspace[0] = WS_SYS_SIZE;
-    return ge::GRAPH_SUCCESS;
-}
-
-static void ReadTransposeAttrs(gert::TilingContext* context, bool& transA, bool& transB)
-{
-    transA = false;
-    transB = false;
-    auto attrs = context->GetAttrs();
-    if (attrs == nullptr) {
-        return;
-    }
-    const bool* pa = attrs->GetAttrPointer<bool>(0);
-    if (pa != nullptr) {
-        transA = *pa;
-    }
-    const bool* pb = attrs->GetAttrPointer<bool>(1);
-    if (pb != nullptr) {
-        transB = *pb;
-    }
-}
+constexpr int32_t QBMM_TILING_MAGIC = 0x51424D33;
 
 static ge::graphStatus QuantBatchMatMulV3TilingFunc(gert::TilingContext* context)
 {
-    uint64_t ubSize;
-    int64_t coreNum;
-    OP_CHECK_IF(
-        GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS,
-        OP_LOGE(context, "GetPlatformInfo error"),
-        return ge::GRAPH_FAILED);
-
-    OP_CHECK_IF(
-        GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
-        OP_LOGE(context, "GetWorkspaceSize error"),
-        return ge::GRAPH_FAILED);
-
-    QuantBatchMatMulV3TilingData* tiling = context->GetTilingData<QuantBatchMatMulV3TilingData>();
-    OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
+    auto platformInfoPtr = context->GetPlatformInfo();
+    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
 
     bool transA = false;
     bool transB = false;
-    ReadTransposeAttrs(context, transA, transB);
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        const bool* pa = attrs->GetAttrPointer<bool>(0);
+        if (pa != nullptr) { transA = *pa; }
+        const bool* pb = attrs->GetAttrPointer<bool>(1);
+        if (pb != nullptr) { transB = *pb; }
+    }
 
-    int64_t m = 0;
-    int64_t n = 0;
-    int64_t k = 0;
-    const gert::StorageShape* x1ShapePtr = context->GetInputShape(0);
-    const gert::StorageShape* x2ShapePtr = context->GetInputShape(1);
-    if ((x1ShapePtr != nullptr) && (x1ShapePtr->GetStorageShape().GetDimNum() == 2)) {
-        const gert::Shape& s = x1ShapePtr->GetStorageShape();
-        m = transA ? s.GetDim(1) : s.GetDim(0);
-        k = transA ? s.GetDim(0) : s.GetDim(1);
+    int64_t m = 0, n = 0, k = 0;
+    const gert::StorageShape* x1 = context->GetInputShape(0);
+    const gert::StorageShape* x2 = context->GetInputShape(1);
+    if ((x1 != nullptr) && (x1->GetStorageShape().GetDimNum() == 2)) {
+        m = transA ? x1->GetStorageShape().GetDim(1) : x1->GetStorageShape().GetDim(0);
+        k = transA ? x1->GetStorageShape().GetDim(0) : x1->GetStorageShape().GetDim(1);
     }
-    if ((x2ShapePtr != nullptr) && (x2ShapePtr->GetStorageShape().GetDimNum() == 2)) {
-        const gert::Shape& s = x2ShapePtr->GetStorageShape();
-        n = transB ? s.GetDim(0) : s.GetDim(1);
-        const int64_t k2 = transB ? s.GetDim(1) : s.GetDim(0);
-        if (k2 > 0) {
-            k = k2;
-        }
+    if ((x2 != nullptr) && (x2->GetStorageShape().GetDimNum() == 2)) {
+        n = transB ? x2->GetStorageShape().GetDim(0) : x2->GetStorageShape().GetDim(1);
+        const int64_t k2 = transB ? x2->GetStorageShape().GetDim(1) : x2->GetStorageShape().GetDim(0);
+        if (k2 > 0) { k = k2; }
     }
-    if ((m <= 0) || (n <= 0)) {
-        /* fall back to the declared output shape when an input shape is unavailable */
-        const gert::StorageShape* outShapePtr = context->GetOutputShape(0);
-        if ((outShapePtr != nullptr) && (outShapePtr->GetStorageShape().GetDimNum() == 2)) {
-            const gert::Shape& s = outShapePtr->GetStorageShape();
-            m = s.GetDim(0);
-            n = s.GetDim(1);
-        }
-    }
-    OP_CHECK_IF((m <= 0) || (n <= 0) || (k <= 0), OP_LOGE(context, "invalid problem size"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF((m <= 0) || (n <= 0) || (k <= 0), OP_LOGE(context, "invalid shape"), return ge::GRAPH_FAILED);
 
     int64_t scaleLen = 1;
-    const gert::StorageShape* scaleShapePtr = context->GetInputShape(2);
-    if (scaleShapePtr != nullptr) {
-        const int64_t sz = scaleShapePtr->GetStorageShape().GetShapeSize();
-        if (sz > 0) {
-            scaleLen = sz;
-        }
+    const gert::StorageShape* sc = context->GetInputShape(2);
+    if (sc != nullptr) {
+        const int64_t s = sc->GetStorageShape().GetShapeSize();
+        if (s > 0) { scaleLen = s; }
+    }
+    int64_t ptLen = m;
+    const gert::StorageShape* pt = context->GetInputShape(3);
+    if (pt != nullptr) {
+        const int64_t s = pt->GetStorageShape().GetShapeSize();
+        if (s > 0) { ptLen = s; }
     }
 
-    int64_t cores = (coreNum > 0) ? coreNum : 1;
-    if (cores > m) {
-        cores = m;
+    QuantBatchMatMulV3TilingData* t = context->GetTilingData<QuantBatchMatMulV3TilingData>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, t);
+
+    int64_t aicNum = ascendcPlatform.GetCoreNumAic();
+    if (aicNum <= 0) { aicNum = 1; }
+
+    /* Pick the output grid. Pure M-split across all cores is empirically fastest
+     * (a narrow column tile makes the L1 copy of B strided and ~3x slower), so N is
+     * only split when there are not enough rows to fill the cores; the column tile is
+     * kept >= min(n,512) wide. */
+    int64_t nPerFloor = (n < 512) ? n : 512;
+    int64_t bestTm = 1, bestTn = 1, bestCost = -1;
+    for (int64_t tn = 1; tn <= aicNum && tn <= n; ++tn) {
+        int64_t tm = aicNum / tn;
+        if (tm > m) { tm = m; }
+        if (tm < 1) { continue; }
+        int64_t mPer = (m + tm - 1) / tm;
+        int64_t nPer = (n + tn - 1) / tn;
+        if (nPer < nPerFloor) { continue; }
+        int64_t cost = mPer + nPer;
+        if (bestCost < 0 || cost < bestCost) { bestCost = cost; bestTm = tm; bestTn = tn; }
     }
-    if (cores < 1) {
-        cores = 1;
-    }
-    const int64_t rowsPerCore = CeilDiv(m, cores);
+    int64_t gridM = bestTm;
+    int64_t gridN = bestTn;
+    int64_t mPer = (m + gridM - 1) / gridM;
+    int64_t nPer = (n + gridN - 1) / gridN;
+    t->gridM = static_cast<int32_t>(gridM);
+    t->gridN = static_cast<int32_t>(gridN);
 
-    tiling->totalNum = m * k;
-    tiling->blockFactor = rowsPerCore;
-    tiling->ubFactor = 32;
-    tiling->m = m;
-    tiling->n = n;
-    tiling->k = k;
-    tiling->transposeX1 = transA ? 1 : 0;
-    tiling->transposeX2 = transB ? 1 : 0;
-    tiling->scaleLen = static_cast<int32_t>(scaleLen);
-    tiling->magic = QUANT_BATCH_MATMUL_V3_TILING_MAGIC;
+    /* Tile the matmul for one core's output tile; the runtime SetOrgShape() supplies
+     * the real leading dimensions of A / B / C. */
+    matmul_tiling::MatmulApiTiling mm(ascendcPlatform);
+    mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT8, transA);
+    mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT8, transB);
+    mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT32);
+    mm.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT32);
+    mm.SetShape(static_cast<int32_t>(mPer), static_cast<int32_t>(nPer), static_cast<int32_t>(k));
+    mm.SetOrgShape(static_cast<int32_t>(m), static_cast<int32_t>(n), static_cast<int32_t>(k));
+    mm.SetBias(false);
+    mm.SetBufferSpace(-1, -1, -1);
+    int64_t rc = mm.GetTiling(t->mm);
+    OP_CHECK_IF(rc != 0, OP_LOGE(context, "MatmulApiTiling GetTiling failed"), return ge::GRAPH_FAILED);
+    t->mm.usedCoreNum = 1;
 
-    context->SetBlockDim(static_cast<uint32_t>(cores));
+    t->m = m;
+    t->n = n;
+    t->k = k;
+    t->scaleLen = static_cast<int32_t>(scaleLen);
+    t->ptLen = static_cast<int32_t>(ptLen);
+    t->magic = QBMM_TILING_MAGIC;
+    t->transposeX1 = transA ? 1 : 0;
+    t->transposeX2 = transB ? 1 : 0;
+    size_t sysWs = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
+    t->sysWs = static_cast<int64_t>(sysWs);
 
-    /* the kernel is type independent: the int8 path is selected for every dtype */
-    context->SetTilingKey(GET_TPL_TILING_KEY(QUANTBATCHMATMULV3_TPL_SCH_MODE_1));
+    size_t* ws = context->GetWorkspaceSizes(1);
+    OP_CHECK_NULL_WITH_CONTEXT(context, ws);
+    ws[0] = sysWs + static_cast<size_t>(m * n) * sizeof(int32_t) + 4096;
+
+    uint32_t blockDim = static_cast<uint32_t>(gridM * gridN);
+
+
+    context->SetBlockDim(blockDim);
+    context->SetTilingKey(0);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -170,4 +134,11 @@ struct QuantBatchMatMulV3CompileInfo {};
 
 IMPL_OP_OPTILING(QuantBatchMatMulV3).Tiling(QuantBatchMatMulV3TilingFunc).TilingParse<QuantBatchMatMulV3CompileInfo>(TilingParseForQuantBatchMatMulV3);
 
-} // namespace optiling
+}  // namespace optiling
+
+
+
+
+
+
+

@@ -1,27 +1,27 @@
 /*!
  * \file quant_batch_mat_mul_v3_tiling_data.h
- * \brief tiling data struct
+ * \brief tiling data for the Matmul(cube) implementation
  */
+#ifndef QBMM_TILING_DATA_H
+#define QBMM_TILING_DATA_H
 
-#ifndef _QUANTBATCHMATMULV3_TILING_DATA_H_
-#define _QUANTBATCHMATMULV3_TILING_DATA_H_
+#include "kernel_tiling/kernel_tiling.h"
 
-/* Marks a tiling buffer that was filled by the host tiling function. */
-constexpr int32_t QUANT_BATCH_MATMUL_V3_TILING_MAGIC = 0x51424D33;
-
-struct QuantBatchMatMulV3TilingData {
-    int64_t totalNum = 0;     // element count of x1 (m * k)
-    int64_t blockFactor = 1;  // output rows per core (informative)
-    int64_t ubFactor = 0;     // rows per output tile (informative)
-    int64_t m = 0;            // output rows
-    int64_t n = 0;            // output columns
-    int64_t k = 0;            // reduction length
-    int64_t tileM = 1;        // output rows owned by one tile
-    int64_t laneN = 64;       // output columns of one tile, multiple of 64
-    int64_t mTiles = 1;       // number of row tiles
-    int64_t nTiles = 1;       // number of column tiles
-    int32_t scaleLen = 1;     // element count of scale (1 means broadcast)
-    int32_t ptLen = 1;        // element count of pertokenScale (1 means broadcast)
-    int32_t magic = 0;        // QUANT_BATCH_MATMUL_V3_TILING_MAGIC when valid
+#pragma pack(push, 8)
+struct alignas(8) QuantBatchMatMulV3TilingData {
+    TCubeTiling mm;      // cube tiling computed for one core's output tile
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int32_t scaleLen = 1;
+    int32_t ptLen = 1;
+    int32_t magic = 0;
+    int32_t transposeX1 = 0;
+    int32_t transposeX2 = 0;
+    int64_t sysWs = 0;   // lib-api workspace bytes that precede the user area
+    int32_t gridM = 1;   // number of row tiles of the output grid
+    int32_t gridN = 1;   // number of column tiles of the output grid
 };
+#pragma pack(pop)
+
 #endif

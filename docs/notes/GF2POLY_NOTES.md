@@ -91,3 +91,94 @@ bash /root/work/pack.sh                                                     # �
 日志：`/tmp/fixb_gf2poly_build.log`、`/tmp/fixb_gf2poly_example.log`、`/tmp/fixb_gf2p_verify.log`、
 `/tmp/fixb_gf2p_full.log`、`/tmp/fixb_gf2p_supp.log`。
 （`run_tests.py`、`supp.py`、`examples/test_gf2poly_io.cpp` 是验证脚手架，不属于 7 件套、不提交。）
+
+---
+
+## 2. 性能优化 v2（2026-11-27，本卡 910B2 / CANN 9.0.0）
+
+交付：`/root/work/npu_kernel/ladder/zips/gf2_poly_7files_v2.zip`（7 entries，**不覆盖原包**）。
+工程：`/root/work/ws/gf2_poly`（build_op.sh 从 v2 zip 重铺可复现）。
+
+### 2.1 基线诊断（device 计时，--repeat 5 取 min，单核 43690 行/24 核）
+| m | mode | N=1M 基线 µs | 每行每核 cycles | 结论 |
+|---|---|---|---|---|
+| 8 | mr | 19937 | ~820 | 每行固定开销主导（nw=1 却走 4bit 表） |
+| 32 | mr | 36779 | ~1500 | 同上 |
+| 64 | mr | 49922 | ~2000 | Barrett(3 次 clmul) 主导 |
+| 128 | mr | 122440 | — | Barrett 主导 |
+| 256 | mr | 351952 | ~14500 | Barrett 主导；nibble 循环 ~4cyc/op |
+- 核数已用满（N=1..24 耗时持平，~24 AIV 核）；不是多核问题。
+- 主因：**标量 4-bit 窗口 clmul 的 nibble 累加循环**（64 nibble × (nw+1) word × 带分支）+ **每行重建 3 次窗口表**（barrett 的 mu/P 表本可复用）。
+
+### 2.2 本轮改动（op_kernel/gf2_poly.h + tiling）
+1. `Gf2ClMul`：nw==1 且两操作数 <2^32（m=8/32）走 **ctz 置位位循环**（乘积 <2^63 单字），省掉 4bit 表；其余 nw 去掉 `if(val==0) continue` 与 `dst<total` 分支，`sft==0` 提到 word 循环外（**分支less**，z 补 1 word 余量）。
+2. **Barrett 常量乘查表上提**：新增 `Gf2BuildWinTab`/`Gf2MulByTab`，在 `Init` 里对**全核共享**的 `muLow_`、`P_` 各建一次 16 项窗口表 `tabMu_/tabP_`，`Gf2ReduceBarrett` 的两处 clmul（q1·mu、q3·P）改用 `Gf2MulByTab`，**每行少建 2 张表**。
+3. `tiling`：`TARGET_TILE_BYTES` 8KB→16KB（减少 per-tile `PipeBarrier<PIPE_ALL>` 次数；UB 约 96KB）。
+4. 未改语义/契约/精度路径；注释全英文，无 cout/cin/非 ASCII。
+
+### 2.3 验收
+- 官方模板 `build.sh -j8 -e`：`PASS: y.bin, mismatched=0/1` `PASSED`。
+- 自建对拍（device 输出 vs samples/reference.py，逐字节）：m∈{8,32,64,128,256} × mode∈{mul,reduce,mul_reduce} × N∈{1,4096} + N=16385（mr），共 35+ 例 **全 PASS**；`CORRECTNESS_ALL_OK`。
+- 同进程多次 launch：`DETERMINISM_OK`（重复 launch 输出逐字节一致）。
+- 日志：`/tmp/g2_finalall.log`、`/tmp/g2_final.log`、`/tmp/g2_scale.log`。
+
+### 2.4 提速（N=1048576，µs，min/REP5）
+| m | mode | 前 | 后 | 倍数 |
+|---|---|---|---|---|
+| 8 | mul_reduce | 19937 | 8458 | 2.36x |
+| 8 | mul | 14760 | 3339 | **4.42x** |
+| 8 | reduce | 6962 | 6804 | 1.02x |
+| 32 | mul_reduce | 36779 | 27564 | 1.33x |
+| 64 | mul_reduce | 49922 | 37045 | 1.35x |
+| 128 | mul_reduce | 122440 | 78876 | 1.55x |
+| 256 | mul_reduce | 351952 | 203075 | 1.73x |
+| 256 | mul | 120802 | 76822 | 1.57x |
+| 256 | reduce | 240386 | 129311 | 1.86x |
+
+### 2.5 下一步（冲 TOP1 必须向量化，路径已定）
+标量已接近极限；TOP1 单核 ~73 cycles/行（256bit clmul+reduce），需 **位并行/行并行向量化**：
+- **lane=行、按字拆成独立 vector**（`W/4` 个 uint32 tensor，R 行/块，R 为 64 倍数，满足 op count≥64）：GM→UB 用 `DataCopyPad` 每字一次 2D 拷贝（blockLen=4B, srcStride=W-4B），**无需 UB 转置**。
+- clmul(a,b)：逐 bit t of b，`mask = Muls((b>>t)&1, -1)` 对全部字 tensor 通用（lane=行，无广播）；`z_w ^= (a<<t)_w & mask`，跨字进位用 `a_{w-1}>>(32-t)`。估 ~140 指令/行（m=256）→ 约 20-35x。
+- Barrett reduce：mu/P 为常量，同上逐位置位/窗口展开，或复用 tabMu/tabP。
+- 余行（<R）走现有标量尾处理。m=8 可用 uint16 lane（1 字节/行，乘积 16bit）。
+- 预计 m=256 mul_reduce 352ms → 10~20ms 量级；需逐位对拍（reference.py）保证精确。
+
+---
+
+## 3. 向量化 v3（2026-11-27）— 行并行 int16 lane
+
+交付：`/root/work/npu_kernel/ladder/zips/gf2_poly_7files_v3.zip`（7 entries，不覆盖 v1/v2）。
+工程：`/root/work/ws/gf2_poly`。
+
+### 3.1 关键硬件约束（踩坑）
+- **dav_c220 向量 `Xor/And/Or` 只支持 int16_t/uint16_t**（uint32 编译期 static_assert 拒绝）。
+- **向量 `Adds/Muls` 只支持 half/float/int16_t/int32_t**（`unsigned short` 被拒！）→ 故全部用 **int16_t** 元素。
+
+### 3.2 设计：lane=行、按 16bit 字拆独立 vector
+- 一个 tile = R 行；对每个 16bit 字 w（`nw16 = W/2`），把该字在所有行上的值存成连续 vector（长度 R）→ "字列"。
+- 位串 clmul：对 b 的每一位 t，`mask = Muls((b>>off)&1, -1)`（bit0 隔离用两次 Shift），对所有字 tensor 通用（lane=行 → 无需行内广播）；`z[bt+w] ^= (a<<off)_w & mask`；跨字进位用 `a[w-1]>>(16-off)`。
+- Barrett：mu/P 为常量 → 预存 **置位位置表** `muBits_/pBits_`，逐置位 `z ^= q<<j`（`VMulConst`）。
+- I/O：`DataCopyPad` 每字一次 2D 拷（GM 侧 `blockLen=2`,`srcStride=W-2` 字节；UB 侧 `dstStride=0`）。需 `GlobalTensor<int16_t>` 视图（DataCopyPad 要求同元素类型）。
+- `R` 按 UB 预算自适应（`(9*nw16+4)*2` 字节/行，~150KB）：m=64→1920, m=128→960, m=256→512（须 64 倍数）。
+- 余行（<R）走原标量 `DoTile`。m=8/32（W=1/4）仍走标量路径（vec_ 仅在 m≥64 且 W%8==0 打开）。
+
+### 3.3 验收
+- 官方模板 `build.sh -e`：`PASS` `PASSED`；`CORRECTNESS_ALL_OK`（m8/32/64/128/256 × 3 模式 × N=1/4096 + N=16385）；`DETERMINISM_OK`×5。
+- 逐位对拍 `samples/reference.py` 全一致。日志 `/tmp/g2_finalall3.log`、`/tmp/g2_v4/v5/v6.log`。
+
+### 3.4 提速（N=1048576，µs，min/REP5；对比 v1 原始）
+| m | mode | v1 | v3 | 倍数 |
+|---|---|---|---|---|
+| 64 | mul_reduce | 49922 | 10370 | 4.8x |
+| 128 | mul_reduce | 122440 | 20458 | 6.0x |
+| 256 | mul_reduce | 351952 | 53269 | **6.6x** |
+| 256 | reduce | 240386 | 28683 | 8.4x |
+| 128 | reduce | 48680 | 13537 | 3.6x |
+| 64 | reduce | 22650 | 8147 | 2.8x |
+| 256 | mul | 120802 | 38004 | 3.2x |
+| 128 | mul | 31765 | 18510 | 1.7x |
+
+### 3.5 剩余瓶颈 / 下一步
+- 每字 2 字节块 DMA（32B 扇区放大 ~16x）估占 m=256 reduce 约 20/28ms → **I/O 是当前最大瓶颈**。
+- 修法：一次搬连续 [R,W]（1 次大 DMA）+ UB 内 **16x16 转置**（`Transpose` 的 `TRANSPOSE_ND2ND_B16`，int16）把 [R][nw16] 转成 [nw16][R]；m=128/64 补零到 16 字。预计 m=256 mr 53→~30ms。
+- 计算侧仍是 O((8W)^2) 位串；进一步的 Karatsuba / 8-bit 窗口需按行 select，暂不划算。
