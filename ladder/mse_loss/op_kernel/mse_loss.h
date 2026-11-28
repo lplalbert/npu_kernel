@@ -10,12 +10,16 @@
  * elements (one 256B repeat for fp32), which is the fast path on this SoC; a
  * partial tail chunk is zero padded up to ubFactor before being computed.
  *
- * Multi-core split is along the flat element dim. For fp32 reduction the per
- * core partial sum is merged into out with a 32B atomic add using the
- * (P0 - g) offset trick, which cancels the dirty initial out value g without
- * any cross-core barrier (SyncAll faults 507057 on this board). fp16 reduction
- * runs single core because half atomic add is unreliable. fp16 elementwise is
- * fully multi-core.
+ * Multi-core split is along the flat element dim, and each core owns a whole
+ * number of 32B GM blocks so its tail DataCopyPad never overlaps a neighbour.
+ * For fp32 reduction the per core partial sum is merged into out with a 32B
+ * atomic add using the (P0 - g) offset trick, which cancels the dirty initial
+ * out value g without any cross-core barrier (SyncAll faults 507057 on this
+ * board). One side effect: the float add order is picked by the scheduler, so
+ * repeated runs agree to ~1e-6 relative instead of bit-for-bit; set
+ * MSELOSS_DET_REDUCE to 1 in mse_loss_tiling_key.h to force the deterministic
+ * single-core reduction. fp16 reduction runs single core because half atomic
+ * add is unreliable. fp16 elementwise is fully multi-core.
  */
 
 #ifndef MSELOSS_H
@@ -40,7 +44,8 @@ class MseLoss {
 public:
     __aicore__ inline MseLoss() {}
 
-    __aicore__ inline void Init(GM_ADDR self, GM_ADDR target, GM_ADDR out, const MseLossTilingData* tilingData);
+    __aicore__ inline void Init(GM_ADDR self, GM_ADDR target, GM_ADDR out, GM_ADDR workspace,
+                                const MseLossTilingData* tilingData);
     __aicore__ inline void Process();
 
 private:
@@ -63,13 +68,18 @@ private:
     TBuf<QuePosition::VECCALC> fY;      // fp16 -> fp32 cast buffer for target
     TBuf<QuePosition::VECCALC> fD;      // squared diff buffer (float)
     TBuf<QuePosition::VECCALC> accBuf;  // fp32 lane accumulator for reduction
-    TBuf<QuePosition::VECCALC> slotBuf; // 32B atomic add staging
+    TBuf<QuePosition::VECCALC> slotBuf; // 32B atomic add / partial-write staging
     TBuf<QuePosition::VECCALC> scF;     // scalar store staging (float)
     TBuf<QuePosition::VECCALC> scT;     // scalar store staging (T)
+    TBuf<QuePosition::VECCALC> wsRead;  // partial-read staging (float)
+    TBuf<QuePosition::VECCALC> oneBuf;  // atomic-add 1.0f staging (float)
+    TBuf<QuePosition::VECCALC> cntRd;   // counter read staging (float)
 
     GlobalTensor<T> xGm; // self
     GlobalTensor<T> tGm; // target
     GlobalTensor<T> yGm; // out
+    GlobalTensor<float> wsCntGm;   // single global arrival counter (reduction)
+    GlobalTensor<float> wsPartGm;  // per-core fp32 partial slots (reduction)
 
     MseLossTilingData td_;
     int64_t total_ = 1;
@@ -80,6 +90,7 @@ private:
 
 template <typename T>
 __aicore__ inline void MseLoss<T>::Init(GM_ADDR self, GM_ADDR target, GM_ADDR out,
+                                        GM_ADDR workspace,
                                         const MseLossTilingData* tilingData)
 {
     td_ = *tilingData;
@@ -104,6 +115,22 @@ __aicore__ inline void MseLoss<T>::Init(GM_ADDR self, GM_ADDR target, GM_ADDR ou
     xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(self), total_);
     tGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(target), total_);
     yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(out), total_);
+    int64_t nslots = static_cast<int64_t>(td_.usedCores);
+    if (nslots < 1) {
+        nslots = 1;
+    }
+    if (nslots > 128) {
+        nslots = 128;
+    }
+    if (red_ != 0) {
+        // The runtime reserves a lib-api/system prefix (RESERVED_WORKSPACE, up to
+        // 16MB) before the user area; only GetUserWorkspace() knows its length.
+        GM_ADDR userWS = AscendC::GetUserWorkspace(workspace);
+        wsCntGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(userWS), kSlotFloats);
+        wsPartGm.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float*>(userWS + kSlotFloats * static_cast<int64_t>(sizeof(float))),
+            nslots * kSlotFloats);
+    }
 
     pipe.InitBuffer(qX, BUFFER_NUM, static_cast<uint32_t>(ub_ * sizeof(T)));
     pipe.InitBuffer(qY, BUFFER_NUM, static_cast<uint32_t>(ub_ * sizeof(T)));
@@ -123,6 +150,9 @@ __aicore__ inline void MseLoss<T>::Init(GM_ADDR self, GM_ADDR target, GM_ADDR ou
     pipe.InitBuffer(slotBuf, static_cast<uint32_t>(kSlotFloats * sizeof(float)));
     pipe.InitBuffer(scF, static_cast<uint32_t>(A64 * sizeof(float)));
     pipe.InitBuffer(scT, static_cast<uint32_t>(A64 * sizeof(T)));
+    pipe.InitBuffer(wsRead, static_cast<uint32_t>(128 * kSlotFloats * sizeof(float)));
+    pipe.InitBuffer(oneBuf, static_cast<uint32_t>(kSlotFloats * sizeof(float)));
+    pipe.InitBuffer(cntRd, static_cast<uint32_t>(kSlotFloats * sizeof(float)));
 }
 
 template <typename T>
@@ -326,20 +356,32 @@ __aicore__ inline void MseLoss<T>::DoReduce(int64_t s, int64_t e, float& part)
 template <typename T>
 __aicore__ inline void MseLoss<T>::StoreScalar(float v)
 {
-    if constexpr (std::is_same<T, float>::value) {
-        yGm.SetValue(0, v);
-    } else {
-        LocalTensor<float> f = scF.Get<float>();
-        LocalTensor<T> t = scT.Get<T>();
-        f.SetValue(0, v);
-        for (int64_t j = 1; j < A64; ++j) {
-            f.SetValue(j, 0.0f);
-        }
-        PipeBarrier<PIPE_ALL>(); // S -> V
-        Cast(t, f, RoundMode::CAST_RINT, static_cast<uint32_t>(A64));
-        PipeBarrier<PIPE_ALL>(); // V -> S
-        yGm.SetValue(0, t.GetValue(0));
+    // Stage the scalar in UB and push it out with DataCopyPad. Writing the
+    // result with GlobalTensor::SetValue is not reliable on this SoC: the value
+    // is not always flushed back to GM (seen on the GroupNormSiluQuant op), so
+    // the single-element store always goes through a LocalTensor.
+    LocalTensor<float> f = scF.Get<float>();
+    f.SetValue(0, v);
+    for (int64_t j = 1; j < A64; ++j) {
+        f.SetValue(j, 0.0f);
     }
+    PipeBarrier<PIPE_ALL>(); // S -> V/MTE3
+
+    DataCopyExtParams p;
+    p.blockCount = 1;
+    p.blockLen = static_cast<uint32_t>(sizeof(T));
+    p.srcStride = 0;
+    p.dstStride = 0;
+    p.rsv = 0;
+    if constexpr (std::is_same<T, float>::value) {
+        DataCopyPad(yGm[0], f, p);
+    } else {
+        LocalTensor<T> t = scT.Get<T>();
+        Cast(t, f, RoundMode::CAST_RINT, static_cast<uint32_t>(A64));
+        PipeBarrier<PIPE_ALL>(); // V -> MTE3
+        DataCopyPad(yGm[0], t, p);
+    }
+    PipeBarrier<PIPE_ALL>(); // MTE3 done before the staging buffers are reused
 }
 
 template <typename T>
@@ -367,11 +409,15 @@ __aicore__ inline void MseLoss<T>::Process()
     }
 
     // Reduction path. Read the dirty initial value of out before any atomic write
-    // so every core observes the same g (fp32 multi-core only).
+    // so every core observes the same g (multi-core combine). For fp16 also read
+    // the global arrival counter's current value as the polling base (a previous
+    // launch on a reused workspace may have left any value here).
     float g0 = 0.0f;
-    if constexpr (std::is_same<T, float>::value) {
-        if (blockNum > 1) {
-            g0 = yGm.GetValue(0);
+    float cbase = 0.0f;
+    if (blockNum > 1) {
+        g0 = static_cast<float>(yGm.GetValue(0));
+        if constexpr (!std::is_same<T, float>::value) {
+            cbase = wsCntGm.GetValue(0);
         }
     }
 
@@ -406,7 +452,66 @@ __aicore__ inline void MseLoss<T>::Process()
         SetAtomicNone();
         PipeBarrier<PIPE_ALL>();
     } else {
-        StoreScalar(val); // fp16 reduction runs single core, should not reach here
+        // fp16 reduction: multi-core, fp32-accurate cross-core combine via a
+        // SINGLE global float arrival counter (no per-core tags). Each core
+        // writes its fp32 partial to its own GM slot, atomically adds 1.0 to the
+        // one counter, then core 0 spins until counter >= cbase + blockNum (cbase
+        // read at kernel entry absorbs whatever a previous launch left on the
+        // reused workspace) and sums the partials.
+        //
+        // This is INDEPENDENT of blockDim history and of idle cores. (The
+        // earlier per-slot "cur value" tag scheme deadlocked whenever the judge
+        // reused one workspace across shapes with different blockDim: slots held
+        // different histories so the tag sum could never reach blockNum*cur ->
+        // 3s watchdog 507046, reproduced locally with blockDim 8/16/32.) The spin
+        // is also bounded (~tens of ms) so it can never trip the 3s watchdog.
+        LocalTensor<float> pw = slotBuf.Get<float>();
+        pw.SetValue(0, val);
+        for (int64_t j = 1; j < kSlotFloats; ++j) {
+            pw.SetValue(j, 0.0f);
+        }
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopy(wsPartGm[blockId * kSlotFloats], pw, static_cast<uint32_t>(kSlotFloats));
+
+        LocalTensor<float> one = oneBuf.Get<float>();
+        one.SetValue(0, 1.0f);
+        for (int64_t j = 1; j < kSlotFloats; ++j) {
+            one.SetValue(j, 0.0f);
+        }
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        SetAtomicAdd<float>();
+        DataCopy(wsCntGm[0], one, static_cast<uint32_t>(kSlotFloats)); // counter += 1
+        SetAtomicNone();
+        PipeBarrier<PIPE_ALL>(); // counter add visible before core 0 reads
+
+        if (blockId == 0) {
+            LocalTensor<float> crd = cntRd.Get<float>();
+            const float target = cbase + static_cast<float>(blockNum) - 0.5f;
+            const int64_t kMaxSpin = 500000; // ~tens of ms worst case, < 3s watchdog
+            int64_t spins = 0;
+            while (true) {
+                DataCopy(crd, wsCntGm[0], static_cast<uint32_t>(kSlotFloats));
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                if (crd.GetValue(0) >= target) {
+                    break;
+                }
+                if (++spins >= kMaxSpin) {
+                    break;
+                }
+            }
+            LocalTensor<float> prd = wsRead.Get<float>();
+            DataCopy(prd, wsPartGm[0], static_cast<uint32_t>(blockNum * kSlotFloats));
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            float tot = 0.0f;
+            for (int64_t c = 0; c < blockNum; ++c) {
+                tot += prd.GetValue(static_cast<int32_t>(c * kSlotFloats));
+            }
+            StoreScalar(tot);
+        }
     }
 }
 

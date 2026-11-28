@@ -1,33 +1,24 @@
-﻿/*!
+/*!
  * \file quant_batch_mat_mul_v3_tiling_data.h
- * \brief tiling data for the Matmul(cube) implementation
+ * \brief tiling data struct
  */
-#ifndef QBMM_TILING_DATA_H
-#define QBMM_TILING_DATA_H
 
-#include "kernel_tiling/kernel_tiling.h"
+#ifndef _QUANTBATCHMATMULV3_TILING_DATA_H_
+#define _QUANTBATCHMATMULV3_TILING_DATA_H_
 
-#pragma pack(push, 8)
-struct alignas(8) QuantBatchMatMulV3TilingData {
-    TCubeTiling mm;      // cube tiling computed for one core's output tile
-    int64_t m = 0;
-    int64_t n = 0;
-    int64_t k = 0;
-    int32_t scaleLen = 1;
-    int32_t ptLen = 1;
-    int32_t magic = 0;
-    int32_t transposeX1 = 0;
-    int32_t transposeX2 = 0;
-    int64_t sysWs = 0;   // lib-api workspace bytes that precede the user area
-    int32_t gridM = 1;   // number of row tiles of the output grid
-    int32_t gridN = 1;   // number of column tiles of the output grid
-    int32_t kc = 0;      // K chunk (0 => single chunk, loop-based fallback)
-    int32_t slowPath = 0; // 1 => use the loop-based Matmul config (leading dim > 65535)
-    int32_t gridK = 1;   // K slices (each core owns one; 1 => M/N grid mode)
-    int32_t needA = 0;   // 1 => stage A K-slice into a compact workspace (orgKa overflows)
-    int32_t needB = 0;   // 1 => stage B K-slice into a compact workspace (orgKb overflows)
-    int32_t np = 0;      // >0 => N-split mode: columns per core (n>65535 case)
+/* Marks a tiling buffer that was filled by the host tiling function. */
+constexpr int32_t QUANT_BATCH_MATMUL_V3_TILING_MAGIC = 0x51424D33;
+
+struct QuantBatchMatMulV3TilingData {
+    int64_t totalNum = 0;      // element count of x1 (m * k)
+    int64_t blockFactor = 1;   // output rows owned by one core
+    int64_t ubFactor = 0;      // output rows per inner tile (informative)
+    int64_t m = 0;             // output rows
+    int64_t n = 0;             // output columns
+    int64_t k = 0;             // reduction length
+    int32_t transposeX1 = 0;   // x1 is stored as (k, m) when set
+    int32_t transposeX2 = 0;   // x2 is stored as (n, k) when set
+    int32_t scaleLen = 1;      // element count of scale (1 means broadcast)
+    int32_t magic = 0;         // QUANT_BATCH_MATMUL_V3_TILING_MAGIC when valid
 };
-#pragma pack(pop)
-
 #endif

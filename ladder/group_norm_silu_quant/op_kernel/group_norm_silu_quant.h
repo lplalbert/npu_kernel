@@ -58,12 +58,6 @@ private:
     __aicore__ inline void ProcessGroup(int64_t gidx);
     __aicore__ inline float PwLeaf(int64_t off, int64_t len, bool centered, float mean);
     __aicore__ inline float PwSum(int64_t off, int64_t len, bool centered, float mean);
-    __aicore__ inline float ExpScalarExact(float xf);
-    __aicore__ inline float DfTwoSum(float a, float b, float& e);
-    __aicore__ inline float DfFastTwoSum(float a, float b, float& e);
-    __aicore__ inline float DfTwoProd(float a, float b, float& e);
-    __aicore__ inline float DfDiv(float a, float b);
-    __aicore__ inline float VSum8192(int64_t absOff, bool centered, float mean);
     __aicore__ inline float PwSumChunked(int64_t off, int64_t n, bool centered, float mean);
 
 private:
@@ -78,11 +72,6 @@ private:
     TBuf<QuePosition::VECCALC> red2_;  // reduce temp / result (64 floats)
     TBuf<QuePosition::VECCALC> leafF_; // pairwise leaf staging (float)
     TBuf<QuePosition::VECCALC> leafR_; // pairwise leaf staging (T)
-    TBuf<QuePosition::VECCALC> vTile_; // full 8192-element tile for vectorized numpy sum (float)
-    TBuf<QuePosition::VECCALC> vAcc_;  // 64*8 lane accumulators (float)
-    TBuf<QuePosition::VECCALC> vT1_;   // pair-reduce ping (float)
-    TBuf<QuePosition::VECCALC> vT2_;   // pair-reduce pong (float)
-    TBuf<QuePosition::VECCALC> vRaw_;  // 8192-element raw T staging (fp16)
 
     GlobalTensor<T> xGm_;
     GlobalTensor<T> gGm_;
@@ -121,14 +110,8 @@ __aicore__ inline void GroupNormSiluQuant<T>::Init(GM_ADDR self, GM_ADDR gamma, 
     pipe.InitBuffer(red2_, static_cast<uint32_t>(64 * 4));
     pipe.InitBuffer(leafF_, static_cast<uint32_t>(kPwBlock * 4));
     pipe.InitBuffer(leafR_, static_cast<uint32_t>(kPwBlock * sizeof(T)));
-    // vectorized numpy-pairwise buffers: one 8192-element float tile + 64*8 lanes
-    pipe.InitBuffer(vTile_, static_cast<uint32_t>(8192 * 4));
-    pipe.InitBuffer(vAcc_, static_cast<uint32_t>(512 * 4));
-    pipe.InitBuffer(vT1_, static_cast<uint32_t>(512 * 4));
-    pipe.InitBuffer(vT2_, static_cast<uint32_t>(512 * 4));
     if constexpr (sizeof(T) == 2) {
         pipe.InitBuffer(raw_, static_cast<uint32_t>(((ch + 31) / 32) * 32 * 2));
-        pipe.InitBuffer(vRaw_, static_cast<uint32_t>(8192 * sizeof(T)));
     }
 }
 
@@ -247,9 +230,8 @@ __aicore__ inline float GroupNormSiluQuant<T>::PwLeaf(int64_t off, int64_t len, 
     for (int64_t j = 0; j < 8; ++j) {
         float x = v.GetValue(j);
         if (centered) {
-            volatile float d = x - mean;
-            volatile float sq = d * d;   // volatile: keep the two roundings of (x-mean)^2
-            r[j] = sq;
+            float d = x - mean;
+            r[j] = d * d;
         } else {
             r[j] = x;
         }
@@ -260,9 +242,8 @@ __aicore__ inline float GroupNormSiluQuant<T>::PwLeaf(int64_t off, int64_t len, 
         for (int64_t j = 0; j < 8; ++j) {
             float x = v.GetValue(i + j);
             if (centered) {
-                volatile float d = x - mean;
-                volatile float sq = d * d;   // volatile: no fma, numpy rounds the square first
-                r[j] = r[j] + sq;
+                float d = x - mean;
+                r[j] += d * d;
             } else {
                 r[j] += x;
             }
@@ -272,9 +253,8 @@ __aicore__ inline float GroupNormSiluQuant<T>::PwLeaf(int64_t off, int64_t len, 
     for (; i < len; ++i) {
         float x = v.GetValue(i);
         if (centered) {
-            volatile float d = x - mean;
-            volatile float sq = d * d;
-            res = res + sq;
+            float d = x - mean;
+            res += d * d;
         } else {
             res += x;
         }
@@ -353,215 +333,19 @@ __aicore__ inline float GroupNormSiluQuant<T>::PwSum(int64_t off, int64_t len, b
     return pending;
 }
 
-// ---------------------------------------------------------------------------
-// Vectorized numpy pairwise sum of ONE full 8192-element block (NPY_BUFSIZE).
-//
-// The scalar rule (see PwLeaf/PwSum) over a 8192 block is: 64 leaves of 128
-// elements.  Each leaf has eight interleaved accumulators
-//   r[i] = v[i] + v[8+i] + v[16+i] + ... + v[120+i]     (i = 0..7, sequential)
-// and root = ((r0+r1)+(r2+r3)) + ((r4+r5)+(r6+r7)).  Leaves are then combined
-// with numpy's balanced adjacent tree (64->32->16->8->4->2->1).
-//
-// Vectorization (arithmetic association is EXACTLY the rule above):
-//   * Load all 8192 elements into one fp32 tile.  Leaf l occupies
-//     [l*128, l*128+128).  The eight lane accumulators of ALL 64 leaves live in
-//     `acc` as acc[l*8 + i].
-//   * 16 level-0 repeat Add instructions accumulate the 16 interleaved groups
-//     for every leaf at once (dst block stride 1, src block stride 16 blocks =
-//     128 floats => next leaf), k = 0..15 in order == the sequential rule.
-//   * Three PairReduceSum instructions collapse each leaf's 8 lanes to its root
-//     with the exact adjacent-pair tree (8->4->2->1).
-//   * The 64 leaf roots are combined with the balanced adjacent tree in scalar
-//     fp32 (63 adds per block, negligible).
-// No fused multiply-add / reassociation is introduced, so the result is bit
-// identical to the scalar PwSum over the same 8192 block.
-// ---------------------------------------------------------------------------
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::VSum8192(int64_t absOff, bool centered, float mean)
-{
-    LocalTensor<float> v = vTile_.Get<float>();
-    DataCopyExtParams p;
-    p.blockCount = 1;
-    p.blockLen = static_cast<uint32_t>(8192 * static_cast<int64_t>(sizeof(T)));
-    p.srcStride = 0;
-    p.dstStride = 0;
-    p.rsv = 0;
-    if constexpr (sizeof(T) == 2) {
-        LocalTensor<T> rw = vRaw_.Get<T>();
-        DataCopyPad(rw, xGm_[absOff], p, DataCopyPadExtParams<T>{false, 0, 0, static_cast<T>(0)});
-        PipeBarrier<PIPE_ALL>();
-        Cast(v, rw, RoundMode::CAST_NONE, 8192);
-    } else {
-        DataCopyPad(v, xGm_[absOff], p, DataCopyPadExtParams<T>{false, 0, 0, static_cast<T>(0)});
-    }
-    PipeBarrier<PIPE_ALL>();
-
-    if (centered) {
-        // elementwise (x-mean)^2, two roundings (Sub then Mul) == numpy's array
-        Adds(v, v, -mean, 8192);
-        Mul(v, v, v, 8192);
-        PipeBarrier<PIPE_V>();
-    }
-
-    LocalTensor<float> acc = vAcc_.Get<float>();
-    Duplicate(acc, 0.0f, 512);
-    PipeBarrier<PIPE_V>();
-    // acc[l*8+i] += v[l*128 + k*8 + i] for all 64 leaves; k ascending == rule.
-    BinaryRepeatParams rp(1, 1, 1, 1, 1, 16); // dstBlk,src0Blk,src1Blk,dstRep,src0Rep,src1Rep
-    for (int32_t k = 0; k < 16; ++k) {
-        Add<float, true>(acc, acc, v[k * 8], static_cast<uint64_t>(0xFF), static_cast<uint8_t>(64), rp);
-    }
-    PipeBarrier<PIPE_V>();
-
-    LocalTensor<float> t1 = vT1_.Get<float>();
-    LocalTensor<float> t2 = vT2_.Get<float>();
-    (void)t2;
-    // 8 -> 1 per leaf: BlockReduceSum reduces each 32B (8-float) block to one
-    // value. acc = 64 leaves x 8 lanes; 8 repeats x 64 elements -> 64 contiguous
-    // leaf roots at t1[0..63]. This must equal numpy's leaf tree
-    // ((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7)); verified bit-exact on device.
-    BlockReduceSum<float, true>(t1, acc, 8, 64, 1, 1, 8);
-    PipeBarrier<PIPE_V>();
-    SetFlag<HardEvent::V_S>(EVENT_ID0);
-    WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    float rv[64];
-    for (int64_t l = 0; l < 64; ++l) {
-        rv[l] = t1.GetValue(static_cast<int32_t>(l));
-    }
-    for (int64_t width = 64; width > 1; width >>= 1) {
-        for (int64_t i = 0; i < width / 2; ++i) {
-            rv[i] = rv[i * 2] + rv[i * 2 + 1];
-        }
-    }
-    return rv[0];
-}
-
 // numpy's reduce buffers the iteration in blocks of NPY_BUFSIZE (8192) elements:
 // each buffered block is summed with the pairwise scheme above and the per-block
 // results are accumulated sequentially into the fp32 output.  Verified bit-exact
 // against numpy 1.26 for n in {105, 8191, 8192, 8193, 16385, 32768, 131072, ...}.
-// Full 8192 blocks use the vectorized VSum8192 above; only the final partial
-// block (< 8192) falls back to the scalar PwSum, which is once per group.
 template <typename T>
 __aicore__ inline float GroupNormSiluQuant<T>::PwSumChunked(int64_t off, int64_t n, bool centered, float mean)
 {
     float acc = 0.0f;
-    int64_t i = 0;
-    for (; i + kNpyBufSize <= n; i += kNpyBufSize) {
-        acc = acc + VSum8192(off + i, centered, mean);
-    }
-    if (i < n) {
-        acc = acc + PwSum(off + i, n - i, centered, mean);
+    for (int64_t i = 0; i < n; i += kNpyBufSize) {
+        int64_t len = (n - i < kNpyBufSize) ? (n - i) : kNpyBufSize;
+        acc = acc + PwSum(off + i, len, centered, mean);
     }
     return acc;
-}
-
-// ---------------------------------------------------------------------------
-// Correctly rounded exp() for ONE fp32 argument, in double-float (two fp32) arithmetic.
-// Only used for the few elements whose quantised value sits within a few ulp of a half-integer
-// (the only ones where the vector Exp's 1~2 ulp error can flip the int8 result).
-// Validated on host against numpy: 52 mismatches out of 75000 random inputs (0.069%), which is
-// exactly numpy's own 1-ulp rate vs the correctly rounded value.
-// ---------------------------------------------------------------------------
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::DfTwoSum(float a, float b, float& e)
-{
-    volatile float s = a + b;
-    volatile float bb = s - a;
-    e = (a - (s - bb)) + (b - bb);
-    return s;
-}
-
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::DfFastTwoSum(float a, float b, float& e)
-{
-    volatile float s = a + b;   // requires |a| >= |b|
-    e = b - (s - a);
-    return s;
-}
-
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::DfTwoProd(float a, float b, float& e)
-{
-    volatile float p = a * b;
-    volatile float ta = a * 4097.0f;
-    float ah = ta - (ta - a);
-    float al = a - ah;
-    volatile float tb = b * 4097.0f;
-    float bh = tb - (tb - b);
-    float bl = b - bh;
-    volatile float abh = ah * bh;
-    volatile float d = abh - p;
-    e = ((d + ah * bl) + al * bh) + al * bl;
-    return p;
-}
-
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::DfDiv(float a, float b)
-{
-    volatile float q = a / b;
-    float pe;
-    volatile float pb = q * b;
-    (void)DfTwoProd(q, b, pe);
-    float r = (a - pb) - pe;
-    volatile float corr = r / b;
-    return q + corr;
-}
-
-template <typename T>
-__aicore__ inline float GroupNormSiluQuant<T>::ExpScalarExact(float xf)
-{
-    float x = xf;
-    if (!(x > -87.0f)) {
-        x = -87.0f;
-    }
-    if (x > 88.0f) {
-        x = 88.0f;
-    }
-    volatile float t = x * 1.4426950408889634f;
-    const int32_t k = static_cast<int32_t>(t + ((t >= 0.0f) ? 0.5f : -0.5f));
-    const float kh = static_cast<float>(k);
-    // p = k*ln2 in double-float (ln2 split into 12 high bits + low part)
-    float pl;
-    float ph = DfTwoProd(kh, 0.693145751953125f, pl);
-    pl = pl + kh * 1.428606765330187045e-06f;
-    // r = x - p in double-float
-    float rl;
-    float rh = DfTwoSum(x, -ph, rl);
-    rl = rl - pl;
-    rh = DfFastTwoSum(rh, rl, rl);
-    // exp(r) = 1 + r*(1 + r/2*(1 + r/3*(...)))  Horner in double-float, degree 14
-    float h = 1.0f;
-    float l = 0.0f;
-    for (int32_t i = 14; i >= 1; --i) {
-        float ml;
-        float mh = DfTwoProd(h, rh, ml);
-        ml = (ml + h * rl) + l * rh;
-        float mlo;
-        mh = DfFastTwoSum(mh, ml, mlo);
-        const float fi = static_cast<float>(i);
-        volatile float dh = mh / fi;
-        const float dl = mlo / fi;
-        float el;
-        h = DfTwoSum(1.0f, dh, el);
-        l = el + dl;
-        float l2;
-        h = DfFastTwoSum(h, l, l2);
-        l = l2;
-    }
-    // scale by 2^k (exact for a power of two)
-    if (k > 0) {
-        for (int32_t i = 0; i < k; ++i) {
-            h = h * 2.0f;
-            l = l * 2.0f;
-        }
-    } else {
-        for (int32_t i = 0; i < -k; ++i) {
-            h = h * 0.5f;
-            l = l * 0.5f;
-        }
-    }
-    return h + l;
 }
 
 template <typename T>
@@ -607,16 +391,16 @@ __aicore__ inline void GroupNormSiluQuant<T>::ProcessGroup(int64_t gidx)
     const float var = red.GetValue(0);
     PipeBarrier<PIPE_ALL>();
 
-    // rstd = 1.0 / np.sqrt(var + eps), refined to the correctly rounded fp32 value.
-    // numpy rounds sqrt once and the reciprocal once; the vector Sqrt/Div are allowed to be a
-    // fraction of an ulp off, so both steps get one double-float Newton refinement here (cost is
-    // per-group, i.e. a handful of scalar ops for the whole tensor).
-    // rstd = 1.0 / np.sqrt(var + eps).  numpy rounds sqrt once and the reciprocal once; the
-    // scalar unit's sqrtf/divide are IEEE single precision on this arch (validated against numpy
-    // on 512 groups), so computing it here keeps the value bit-identical to the golden.
-    const float ve = var + eps;
-    const float sq = sqrt(ve);
-    const float rstd = 1.0f / sq;
+    // rstd = 1.0 / np.sqrt(var + eps)
+    Duplicate(red2, var + eps, 64);
+    PipeBarrier<PIPE_ALL>();
+    Sqrt(red2, red2, 64);
+    Duplicate(red, 1.0f, 64);
+    PipeBarrier<PIPE_ALL>();
+    Div(red2, red, red2, 64);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);
+    WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    const float rstd = red2.GetValue(0);
     PipeBarrier<PIPE_ALL>();
 
     // store meanOut / rstdOut (dtype T)
@@ -637,8 +421,6 @@ __aicore__ inline void GroupNormSiluQuant<T>::ProcessGroup(int64_t gidx)
             int64_t cnt = (HW - off < chunk) ? (HW - off) : chunk;
             int64_t cntR = ((cnt + 63) / 64) * 64;
             int32_t n = static_cast<int32_t>(cntR);
-            Duplicate(qsb, qsv, static_cast<int32_t>(chunk));
-            PipeBarrier<PIPE_ALL>();
             LoadToFloat(fx, chBase + off, cnt, cntR, static_cast<T>(0));
             PipeBarrier<PIPE_ALL>();
             // gn = ((x - mean) * rstd * gamma) + beta  (golden op order)
@@ -661,27 +443,8 @@ __aicore__ inline void GroupNormSiluQuant<T>::ProcessGroup(int64_t gidx)
             Div(fx, fx, qsb, n);
             Maxs(fx, fx, -128.0f, n);
             Mins(fx, fx, 127.0f, n);
-            Muls(ta, fx, 1.0f, n);              // ta = clamped q (kept for the boundary test)
-            PipeBarrier<PIPE_ALL>();
             Adds(fx, fx, 12582912.0f, n);
-            Adds(fx, fx, -12582912.0f, n);      // fx = rint(q), round-half-even
-            PipeBarrier<PIPE_ALL>();
-            // boundary distance: tb = |q - rint(q)|; ta = 0.5 - 2e-6*min(|q|,128) - |q - rint(q)|
-            // (> 0 marks an element whose rounding could flip because of the vector Exp error)
-            Sub(tb, ta, fx, n);
-            Abs(tb, tb, n);
-            Abs(ta, ta, n);
-            Mins(ta, ta, 128.0f, n);
-            Muls(ta, ta, 1.0e-6f, n);
-            Muls(ta, ta, -1.0f, n);
-            Adds(ta, ta, 0.5f, n);          // ta = 0.5 - 2e-6*min(|q|,128)
-            Sub(ta, tb, ta, n);             // ta = |q - rint(q)| - (0.5 - margin)  (>0 == borderline)
-            Maxs(ta, ta, 0.0f, n);
-            PipeBarrier<PIPE_ALL>();
-            ReduceSum(red, ta, tb, static_cast<int32_t>(cntR));
-            SetFlag<HardEvent::V_S>(EVENT_ID0);
-            WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            const float anyNear = red.GetValue(0);
+            Adds(fx, fx, -12582912.0f, n);
             PipeBarrier<PIPE_ALL>();
             LocalTensor<half> thi = tc_.Get<half>();
             Cast(thi, fx, RoundMode::CAST_RINT, n);
@@ -689,39 +452,6 @@ __aicore__ inline void GroupNormSiluQuant<T>::ProcessGroup(int64_t gidx)
             LocalTensor<int8_t> i8 = oi8_.Get<int8_t>();
             Cast(i8, thi, RoundMode::CAST_RINT, n);
             PipeBarrier<PIPE_ALL>();
-            // Recompute the (very few) borderline elements with a correctly rounded exp so that the
-            // int8 rounding decision matches the numpy golden bit-for-bit.
-            if (anyNear > 0.0f) {
-                for (int64_t i = 0; i < cnt; ++i) {
-                    if (!(ta.GetValue(i) > 0.0f)) {
-                        continue;
-                    }
-                    volatile float t1 = static_cast<float>(xGm_.GetValue(chBase + off + i)) - mean;
-                    volatile float t2 = t1 * rstd;
-                    volatile float t3 = t2 * gcv;
-                    volatile float yv = t3 + bcv;
-                    float sv;
-                    if (doSilu) {
-                        float ev = ExpScalarExact(-yv);
-                        volatile float dv = 1.0f + ev;
-                        sv = DfDiv(static_cast<float>(yv), dv);
-                    } else {
-                        sv = yv;
-                    }
-                    float qv = DfDiv(sv, qsv);
-                    float cv = (qv < -128.0f) ? -128.0f : ((qv > 127.0f) ? 127.0f : qv);
-                    volatile float rv = (cv + 12582912.0f) - 12582912.0f;
-                    int32_t iv = static_cast<int32_t>(rv);
-                    if (iv < -128) {
-                        iv = -128;
-                    }
-                    if (iv > 127) {
-                        iv = 127;
-                    }
-                    i8.SetValue(i, static_cast<int8_t>(iv));
-                }
-                PipeBarrier<PIPE_ALL>();
-            }
             StoreInt8(i8, chBase + off, cnt);
         }
     }

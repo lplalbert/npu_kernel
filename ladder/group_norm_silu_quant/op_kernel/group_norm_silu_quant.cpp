@@ -1,6 +1,6 @@
 /*!
  * \file group_norm_silu_quant.cpp
- * \brief GroupNormSiluQuant  kernel
+ * \brief GroupNormSiluQuant 算子 kernel 入口
  */
 
 #include "group_norm_silu_quant.h"

@@ -29,10 +29,5 @@ struct ConvTranspose2DTilingData {
     int32_t usedCores = 1;
     int32_t useScalar = 0;
     int32_t accMode = 0;  // 2: per tap accumulators (reference order), 1: kahan folding, 0: plain
-    int64_t owBlockSize = 0;  // output-width block size used by the vector path
-    int64_t wbSize = 0;       // inner vector chunk width (multiple of 64)
-    int32_t winSeg = 0;       // 1 = load only the needed x slice per block
-    int32_t winPad = 0;       // (reserved)
-    int64_t winSegSize = 0;   // padded max x-slice length when winSeg == 1
 };
 #endif

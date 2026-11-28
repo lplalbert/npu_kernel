@@ -2,9 +2,9 @@
  * \file quant_batch_mat_mul_v3_def.cpp
  * \brief QuantBatchMatMulV3 operator definition
  *
- * x1 / x2 are int8 and stored in ND as (m, k) and (k, n); scale is channel (n)
- * aligned and may also be a single broadcast value; pertokenScale is token (m)
- * aligned; out is bf16 of shape (m, n).  The operator has no transpose attribute.
+ * x1 / x2 are int8 and stored in ND as (m, k) and (k, n), scale is channel (n)
+ * aligned and may also be a single broadcast value, pertokenScale is token (m)
+ * aligned and out is bf16 of shape (m, n).
  */
 #include "register/op_def_registry.h"
 

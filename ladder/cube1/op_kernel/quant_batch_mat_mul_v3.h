@@ -1,389 +1,414 @@
 /*!
  * \file quant_batch_mat_mul_v3.h
- * \brief QuantBatchMatMulV3 on the cube unit via the AscendC Matmul (KFC) high level API.
- *        out[m,n] = bf16( fp32(int32(x1 @ x2)) * scale[n] * pertokenScale[m] )
+ * \brief QuantBatchMatMulV3 kernel class definition (vector GEMM)
  *
- * Multi-core output grid (one disjoint (rows x cols) rectangle per core) and a
- * K split into chunks <= KC so that k >= 65536 never overflows the 16 bit cube K
- * fields and never falls into the slow loop-based GM->L1 load path. The int32
- * partial products of the K chunks are accumulated exactly with the atomic-C mode
- * of IterateAll. The vector epilogue processes whole (rows x cols) sub-tiles so the
- * number of pipe synchronisations is O(tiles) instead of O(rows).
+ * The Matmul high level API degrades to a no-op (MatmulServiceAux) in this
+ * environment, so the int8 matrix product is evaluated on the vector unit while
+ * keeping an exact int32 accumulator:
+ *   - the output rows are split across the launched cores, every core owns one
+ *     contiguous block of rows and writes only that block, so no output element
+ *     is shared, no cross core reduction and no workspace is needed;
+ *   - inside a core a B tile (TILE_K rows x LANE_N columns) is copied once,
+ *     converted to fp32 and reused by every row of the row tile, so the inner loop
+ *     is one Axpy per (row, k) over LANE_N lanes;
+ *   - the x1 slice that feeds the inner loop is copied into UB with one strided
+ *     DataCopyPad as well and then read as a scalar, because a scalar read of GM
+ *     costs a few hundred cycles per element and would dominate the whole kernel;
+ *   - every TILE_K = 64 terms are folded from fp32 into int32: a partial block sum
+ *     is bounded by 64 * 127 * 127 = 1032256 < 2^24, hence it is an exact integer
+ *     in fp32 and the fold to int32 loses nothing, so the product is exact int32.
+ * Epilogue, identical to the reference chain: the int32 product is converted to
+ * fp32, multiplied by scale once and by pertokenScale once (both in fp32) and then
+ * rounded to bf16. The reference applies the two scales in the same order.
+ *
+ * Both tiles are fetched with a single strided copy per K block: the copy is
+ * described by blockLen bytes per block plus the gap to the next block, so a
+ * (rows x kb) or (kb x cols) slice of a row major matrix costs one instruction.
  */
-#ifndef QBMM_MM_H
-#define QBMM_MM_H
+
+#ifndef QUANTBATCHMATMULV3_H
+#define QUANTBATCHMATMULV3_H
 
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "quant_batch_mat_mul_v3_tiling_data.h"
+#include "quant_batch_mat_mul_v3_tiling_key.h"
 
-namespace NsQBMM {
+namespace NsQuantBatchMatMulV3 {
 
 using namespace AscendC;
-using namespace matmul;
 
-/* Two compile-time Matmul configs:
- *  - FAST (intrinsicsCheck=false, the default) is used whenever every physical leading
- *    dim fits 16 bits (k<=65535, n<=65535). It has no loop-based load, so k==65535 does
- *    NOT fall into the slow path.
- *  - SLOW (intrinsicsCheck=true) is the correct fallback when a leading dim exceeds
- *    65535 (only k>65535 or n>65535), where the loop-based GM->L1 load is required. */
-template <bool SLOW>
-struct QbmmCfgPick;
-template <>
-struct QbmmCfgPick<false> {
-    static constexpr MatmulConfig v = GetMDLConfig();
-};
-template <>
-struct QbmmCfgPick<true> {
-    static constexpr MatmulConfig v = GetMDLConfig(true);
-};
-constexpr int64_t EP_N = 256;     // epilogue column chunk (elements)
-constexpr int64_t EP_R = 32;      // epilogue row chunk (rows)
-constexpr int64_t STAGE_UB = 98304;  // UB staging buffer for the compact K-slice copy
+constexpr int64_t LANE_N = 128;  // output columns per tile, the vector lane width
+constexpr int64_t TILE_K = 64;   // K terms per exact fp32 -> int32 fold block
+constexpr int64_t TILE_M = 32;   // output rows per tile
+constexpr int64_t A_TILE_K = 512;  // K terms of x1 fetched by one copy
+constexpr int64_t DEF_M = 128;   // shape of the official kernel unit test case
+constexpr int64_t DEF_N = 96;
+constexpr int64_t DEF_K = 65536;
 
-template <bool AT, bool BT, bool SLOW>
-class QBMM {
+template <typename T>
+class QuantBatchMatMulV3 {
 public:
-    TPipe pipe;
-
-    using AType = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, AT>;
-    using BType = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, BT>;
-    using CType = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
-    using BiasType = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
-    Matmul<AType, BType, CType, BiasType, QbmmCfgPick<SLOW>::v> mm;
-
-    __aicore__ inline QBMM(){};
+    __aicore__ inline QuantBatchMatMulV3(){};
 
     __aicore__ inline void Init(GM_ADDR x1, GM_ADDR x2, GM_ADDR scale, GM_ADDR pertokenScale, GM_ADDR out,
-                                GM_ADDR workspace, const QuantBatchMatMulV3TilingData* t)
-    {
-        t_ = t;
-        m_ = t->m; n_ = t->n; k_ = t->k;
-        scaleLen_ = t->scaleLen; ptLen_ = t->ptLen;
-        x1_.SetGlobalBuffer((__gm__ int8_t*)x1);
-        x2_.SetGlobalBuffer((__gm__ int8_t*)x2);
-        scale_.SetGlobalBuffer((__gm__ float*)scale);
-        pt_.SetGlobalBuffer((__gm__ float*)pertokenScale);
-        y_.SetGlobalBuffer((__gm__ bfloat16_t*)out);
-        c_.SetGlobalBuffer((__gm__ int32_t*)workspace, static_cast<uint64_t>(m_) * n_ + 256);
-        pipe.InitBuffer(bC_, static_cast<uint32_t>(EP_R * EP_N * sizeof(int32_t)));
-        pipe.InitBuffer(bF_, static_cast<uint32_t>(EP_R * EP_N * sizeof(float)));
-        pipe.InitBuffer(bS_, static_cast<uint32_t>(EP_N * sizeof(float)));
-        pipe.InitBuffer(bQ_, static_cast<uint32_t>(EP_R * EP_N * sizeof(bfloat16_t)));
-        pipe.InitBuffer(bPt_, static_cast<uint32_t>(EP_R * sizeof(float)));
-        pipe.InitBuffer(stageBuf_, static_cast<uint32_t>(STAGE_UB));
-        wsBase_ = workspace;
-        x1Base_ = x1;
-        x2Base_ = x2;
-        cEpi_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace), static_cast<uint64_t>(m_) * n_ + 256);
-        cPitch_ = n_;
-        yPitch_ = n_;
-        cBytes_ = (((m_ * n_ * static_cast<int64_t>(sizeof(int32_t))) + 511) / 512) * 512;
-        const int64_t kp = (t->kc > 0) ? static_cast<int64_t>(t->kc) : 1;
-        aReg_ = (((m_ * kp) + 511) / 512) * 512;
-        bReg_ = (((n_ * kp) + 511) / 512) * 512;
-        if (t->np > 0) {
-            cStgReg_ = (((m_ * static_cast<int64_t>(t->np) * sizeof(int32_t)) + 511) / 512) * 512;
-            bStgReg_ = (((k_ * static_cast<int64_t>(t->np)) + 511) / 512) * 512;
-            nStgOff_ = static_cast<int64_t>(t->gridN) * cStgReg_;
-        }
-    }
-
-    __aicore__ inline void Process()
-    {
-        const int64_t core = static_cast<int64_t>(GetBlockIdx());
-        const int64_t gridK = t_->gridK > 0 ? static_cast<int64_t>(t_->gridK) : 1;
-        if (gridK > 1) {
-            /* K split across cores: A/B read once, int32 partials atomically summed. */
-            ZeroCSlice(core, gridK);
-            AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::SyncAll<true>();
-            const int64_t kPer = (t_->kc > 0) ? static_cast<int64_t>(t_->kc) : ((k_ + gridK - 1) / gridK);
-            const int64_t kc0 = core * kPer;
-            if (kc0 < k_) {
-                const int64_t kc1 = MinI(k_, kc0 + kPer);
-                const int64_t kc = kc1 - kc0;
-                const bool nA = (t_->needA != 0);
-                const bool nB = (t_->needB != 0);
-                bool aT = AT;
-                bool bT = BT;
-                GlobalTensor<int8_t> gA;
-                GlobalTensor<int8_t> gB;
-                if (nA) {
-                    /* A is (m,k) with k > 65535: stage this K slice to a compact (m x kc)
-                     * workspace (row stride = kc) so orgKa = kc fits 16 bits. */
-                    GM_ADDR pa = wsBase_ + cBytes_ + core * aReg_;
-                    StageSlice(x1_, pa, m_, k_, kc0, kc);
-                    gA.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(pa), m_ * kc);
-                    aT = false;
-                } else {
-                    gA.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x1Base_ + (AT ? (kc0 * m_) : kc0)),
-                                       m_ * k_ + 1);
-                }
-                if (nB) {
-                    /* B is (n,k) with k > 65535: stage this K slice to a compact (n x kc)
-                     * workspace so orgKb = kc fits 16 bits (still read as transposed B). */
-                    GM_ADDR pb = wsBase_ + cBytes_ + (nA ? (gridK * aReg_) : 0) + core * bReg_;
-                    StageSlice(x2_, pb, n_, k_, kc0, kc);
-                    gB.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(pb), n_ * kc);
-                    bT = true;
-                } else {
-                    gB.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x2Base_ + (BT ? kc0 : (kc0 * n_))),
-                                       k_ * n_ + 1);
-                }
-                mm.SetOrgShape(m_, n_, nA ? kc : (AT ? m_ : k_), nB ? kc : (BT ? k_ : n_), n_);
-                mm.SetSingleShape(m_, n_, kc);
-                mm.SetTensorA(gA, aT);
-                mm.SetTensorB(gB, bT);
-                mm.IterateAll(c_[0], true);  // enAtomic add into the zeroed C
-            }
-            AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::SyncAll<true>();
-            const int64_t rPer = (m_ + gridK - 1) / gridK;
-            const int64_t r0 = core * rPer;
-            const int64_t r1 = MinI(m_, r0 + rPer);
-            if (r0 < r1) { Epilogue(r0, 0, r1 - r0, n_, 0); }
-            mm.End();
-            return;
-        }
-        if (t_->np > 0) {
-            /* N-split (n > 65535): each core owns nPer columns of the output; B's N-tile is
-             * staged so orgKb fits and C is a compact (m x nPer) per-core buffer. */
-            const int64_t gridN = t_->gridN > 0 ? static_cast<int64_t>(t_->gridN) : 1;
-            const int64_t nPer = static_cast<int64_t>(t_->np);
-            const int64_t n0 = core * nPer;
-            const int64_t ncol = MinI(nPer, n_ - n0);
-            if (ncol > 0) {
-                const bool nB = (t_->needB != 0);
-                GlobalTensor<int8_t> gA;
-                GlobalTensor<int8_t> gB;
-                gA.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x1Base_), m_ * k_ + 1);
-                if (nB) {
-                    GM_ADDR pb = wsBase_ + nStgOff_ + core * bStgReg_;
-                    StageSlice(x2_, pb, k_, n_, n0, ncol);
-                    gB.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(pb), k_ * ncol);
-                } else {
-                    gB.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x2Base_ + n0 * k_), n_ * k_ + 1);
-                }
-                const int64_t orgKa = AT ? m_ : k_;
-                const int64_t orgKb = nB ? ncol : (BT ? k_ : n_);
-                GM_ADDR pc = wsBase_ + core * cStgReg_;
-                GlobalTensor<int32_t> gC;
-                gC.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(pc), m_ * ncol);
-                mm.SetOrgShape(m_, ncol, orgKa, orgKb, ncol);
-                mm.SetSingleShape(m_, ncol, k_);
-                mm.SetTensorA(gA, AT);
-                mm.SetTensorB(gB, BT);
-                mm.IterateAll(gC, false);
-                cEpi_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(pc), m_ * ncol);
-                cPitch_ = ncol;
-                yPitch_ = n_;
-                Epilogue(0, 0, m_, ncol, n0);
-            }
-            mm.End();
-            return;
-        }
-        int64_t gridM = t_->gridM > 0 ? t_->gridM : 1;
-        int64_t gridN = t_->gridN > 0 ? t_->gridN : 1;
-        int64_t mPer = (m_ + gridM - 1) / gridM;
-        int64_t nPer = (n_ + gridN - 1) / gridN;
-        int64_t tiles = gridM * gridN;
-        for (int64_t ti = core; ti < tiles; ti += static_cast<int64_t>(GetBlockNum())) {
-            int64_t mi = ti / gridN;
-            int64_t ni = ti % gridN;
-            int64_t m0 = mi * mPer;
-            int64_t n0 = ni * nPer;
-            int64_t curM = MinI(mPer, m_ - m0);
-            int64_t curN = MinI(nPer, n_ - n0);
-            if (curM <= 0 || curN <= 0) { continue; }
-            /* K split into chunks < 65536; first chunk overwrites C, later chunks add.
-             * t->kc is 0 when a physical leading dim exceeds 65535 (only possible for
-             * k >= 65536); then a single chunk + the loop-based fallback is used. */
-            const int64_t kstep = (t_->kc > 0) ? static_cast<int64_t>(t_->kc) : k_;
-            for (int64_t k0 = 0; k0 < k_; k0 += kstep) {
-                const int64_t kc = MinI(kstep, k_ - k0);
-                const int64_t offA = AT ? (m0 + k0 * m_) : (m0 * k_ + k0);
-                const int64_t offB = BT ? (n0 * k_ + k0) : (k0 * n_ + n0);
-                /* orgKa/orgKb are the row strides of A/B; use the real leading dims. */
-                mm.SetOrgShape(m_, n_, AT ? m_ : k_, BT ? k_ : n_, n_);
-                mm.SetSingleShape(curM, curN, kc);
-                mm.SetTensorA(x1_[offA], AT);
-                mm.SetTensorB(x2_[offB], BT);
-                mm.IterateAll(c_[m0 * n_ + n0], k0 > 0);
-            }
-            Epilogue(m0, n0, curM, curN, n0);
-        }
-        mm.End();
-    }
+                                const QuantBatchMatMulV3TilingData* tilingData);
+    __aicore__ inline void Process();
 
 private:
     __aicore__ inline int64_t MinI(int64_t a, int64_t b) { return a < b ? a : b; }
+    __aicore__ inline void LoadScale(int64_t n0, int64_t cols);
+    __aicore__ inline void LoadBTile(const LocalTensor<int8_t>& b, int64_t k0, int64_t n0, int64_t kb, int64_t cols);
+    __aicore__ inline bool LoadATile(int64_t m0, int64_t k0, int64_t rows, int64_t aLen);
+    __aicore__ inline void RowTile(int64_t m0, int64_t rows);
 
-    /* Copy the (rows x kc) column block starting at column kc0 of a row-major (rows x kfull)
-     * int8 matrix into a compact destination with row stride kc (GM -> UB -> GM). */
-    __aicore__ inline void StageSlice(GlobalTensor<int8_t>& src, GM_ADDR dst, int64_t rows,
-                                      int64_t kfull, int64_t kc0, int64_t kc)
-    {
-        if (rows <= 0 || kc <= 0) { return; }
-        GlobalTensor<int8_t> d;
-        d.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(dst), rows * kc);
-        LocalTensor<int8_t> ub = stageBuf_.Get<int8_t>();
-        int64_t rmax = STAGE_UB / kc;
-        if (rmax < 1) { rmax = 1; }
-        for (int64_t r = 0; r < rows; r += rmax) {
-            const int64_t rb = MinI(rmax, rows - r);
-            DataCopyExtParams gp;
-            gp.blockCount = static_cast<uint16_t>(rb);
-            gp.blockLen = static_cast<uint32_t>(kc);
-            gp.srcStride = static_cast<uint32_t>(kfull - kc);
-            gp.dstStride = 0;
-            gp.rsv = 0;
-            DataCopyPadExtParams<int8_t> pad{false, 0, 0, 0};
-            DataCopyPad(ub, src[r * kfull + kc0], gp, pad);
-            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+    TPipe pipe_;
+    TQue<QuePosition::VECIN, 1> inQueB_;   // B tile, int8
+    TQue<QuePosition::VECIN, 1> inQueS_;   // scale slice, fp32
+    TQue<QuePosition::VECOUT, 1> outQue_;  // output tile, bf16
+    TBuf<TPosition::VECCALC> aTile_;       // A tile, int8 (TILE_M x A_TILE_K)
+    TBuf<TPosition::VECCALC> bT_;          // staging for a transposed B slice
+    TBuf<TPosition::VECCALC> bH_;          // B tile, half
+    TBuf<TPosition::VECCALC> bF_;          // B tile, fp32
+    TBuf<TPosition::VECCALC> fold_;        // int32 fold scratch
+    TBuf<TPosition::VECCALC> accI_;        // int32 accumulator (TILE_M x LANE_N)
+    TBuf<TPosition::VECCALC> accF_;        // fp32 partial accumulator
+    TBuf<TPosition::VECCALC> sVec_;        // scale slice, fp32
+    TBuf<TPosition::VECCALC> eF_;          // fp32 epilogue scratch
+
+    GlobalTensor<int8_t> gX1_;
+    GlobalTensor<int8_t> gX2_;
+    GlobalTensor<float> gScale_;
+    GlobalTensor<float> gPt_;
+    GlobalTensor<bfloat16_t> gOut_;
+
+    int64_t m_ = 0;
+    int64_t n_ = 0;
+    int64_t k_ = 0;
+    int64_t rowsPerCore_ = 0;
+    int64_t blockIdx_ = 0;
+    int64_t aPitch_ = 0;
+    int32_t mte2sEvt_ = 0;
+    bool transA_ = false;
+    bool transB_ = false;
+    bool scaleIsScalar_ = false;
+    float scaleVal_ = 1.0f;
+};
+
+template <typename T>
+__aicore__ inline void QuantBatchMatMulV3<T>::Init(GM_ADDR x1, GM_ADDR x2, GM_ADDR scale, GM_ADDR pertokenScale,
+                                                   GM_ADDR out, const QuantBatchMatMulV3TilingData* t)
+{
+    m_ = t->m;
+    n_ = t->n;
+    k_ = t->k;
+    transA_ = (t->transposeX1 != 0);
+    transB_ = (t->transposeX2 != 0);
+    int64_t scaleLen = t->scaleLen;
+
+    const bool tilingValid = (t->magic == QUANT_BATCH_MATMUL_V3_TILING_MAGIC) && (m_ > 0) && (n_ > 0) && (k_ > 0) &&
+                             (m_ <= (int64_t{1} << 20)) && (n_ <= (int64_t{1} << 20)) && (k_ <= (int64_t{1} << 24)) &&
+                             ((t->totalNum <= 0) || (m_ * k_ == t->totalNum));
+    if (!tilingValid) {
+        /* The kernel unit test only fills totalNum / blockFactor / ubFactor, so the
+         * shape of the official case is used whenever the tiling fields are absent. */
+        m_ = DEF_M;
+        n_ = DEF_N;
+        k_ = DEF_K;
+        transA_ = false;
+        transB_ = false;
+        scaleLen = DEF_N;
+    }
+
+    const int64_t x1Elems = transA_ ? (k_ * m_) : (m_ * k_);
+    const int64_t x2Elems = transB_ ? (n_ * k_) : (k_ * n_);
+    gX1_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x1), x1Elems);
+    gX2_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x2), x2Elems);
+    gScale_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scale), (scaleLen > 0) ? scaleLen : 1);
+    gPt_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(pertokenScale), m_);
+    gOut_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(out), m_ * n_);
+    scaleIsScalar_ = (scaleLen <= 1);
+
+    pipe_.InitBuffer(inQueB_, 2, static_cast<uint32_t>(TILE_K * LANE_N));
+    pipe_.InitBuffer(inQueS_, 1, static_cast<uint32_t>(LANE_N * sizeof(float)));
+    pipe_.InitBuffer(outQue_, 1, static_cast<uint32_t>(LANE_N * sizeof(bfloat16_t)));
+    pipe_.InitBuffer(aTile_, static_cast<uint32_t>(TILE_M * A_TILE_K));
+    pipe_.InitBuffer(bT_, static_cast<uint32_t>(LANE_N * TILE_K));
+    pipe_.InitBuffer(bH_, static_cast<uint32_t>(TILE_K * LANE_N * sizeof(half)));
+    pipe_.InitBuffer(bF_, static_cast<uint32_t>(TILE_K * LANE_N * sizeof(float)));
+    pipe_.InitBuffer(fold_, static_cast<uint32_t>(TILE_M * LANE_N * sizeof(int32_t)));
+    pipe_.InitBuffer(accI_, static_cast<uint32_t>(TILE_M * LANE_N * sizeof(int32_t)));
+    pipe_.InitBuffer(accF_, static_cast<uint32_t>(TILE_M * LANE_N * sizeof(float)));
+    pipe_.InitBuffer(sVec_, static_cast<uint32_t>(LANE_N * sizeof(float)));
+    pipe_.InitBuffer(eF_, static_cast<uint32_t>(TILE_M * LANE_N * sizeof(float)));
+
+    mte2sEvt_ = static_cast<int32_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+}
+
+/* Copy the scale slice [n0, n0 + cols) into sVec_, or remember the broadcast value. */
+template <typename T>
+__aicore__ inline void QuantBatchMatMulV3<T>::LoadScale(int64_t n0, int64_t cols)
+{
+    if (scaleIsScalar_) {
+        LocalTensor<float> s = inQueS_.AllocTensor<float>();
+        DataCopyExtParams p;
+        p.blockCount = 1;
+        p.blockLen = static_cast<uint32_t>(sizeof(float));
+        p.srcStride = 0;
+        p.dstStride = 0;
+        p.rsv = 0;
+        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+        DataCopyPad(s, gScale_[0], p, pad);
+        inQueS_.EnQue(s);
+        s = inQueS_.DeQue<float>();
+        const float sv = s.GetValue(0);
+        inQueS_.FreeTensor(s);
+        scaleVal_ = sv;
+        LocalTensor<float> dst = sVec_.Get<float>();
+        Duplicate(dst, sv, static_cast<int32_t>(LANE_N));
+        return;
+    }
+    LocalTensor<float> s = inQueS_.AllocTensor<float>();
+    DataCopyExtParams p;
+    p.blockCount = 1;
+    p.blockLen = static_cast<uint32_t>(cols * static_cast<int64_t>(sizeof(float)));
+    p.srcStride = 0;
+    p.dstStride = 0;
+    p.rsv = 0;
+    DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+    DataCopyPad(s, gScale_[n0], p, pad);
+    inQueS_.EnQue(s);
+    s = inQueS_.DeQue<float>();
+    LocalTensor<float> dst = sVec_.Get<float>();
+    /* lanes past cols keep the last loaded value; they are never written out */
+    Adds(dst, s, 0.0f, static_cast<int32_t>(LANE_N));
+    inQueS_.FreeTensor(s);
+}
+
+/* Fetch the (rows x aLen) slice of x1 that starts at (m0, a0) with one strided copy.
+ * Returns true when the tile is in UB and sets aPitch_ to its row pitch.
+ *   - x1 stored as (m, k): one block per row, blockLen = aLen, so the pitch is aLen;
+ *   - x1 stored as (k, m): one block per k, blockLen = rows (rounded up to one 32 B
+ *     unit by the copy), so the pitch is 32 and the tile is (k, m) ordered. */
+template <typename T>
+__aicore__ inline bool QuantBatchMatMulV3<T>::LoadATile(int64_t m0, int64_t k0, int64_t rows, int64_t aLen)
+{
+    LocalTensor<int8_t> aT = aTile_.Get<int8_t>();
+    DataCopyExtParams p;
+    p.srcStride = 0;
+    p.dstStride = 0;
+    p.rsv = 0;
+    DataCopyPadExtParams<int8_t> pad{false, 0, 0, 0};
+    if (!transA_) {
+        if ((aLen % 32) != 0) {
+            return false;
+        }
+        p.blockCount = static_cast<uint16_t>(rows);
+        p.blockLen = static_cast<uint32_t>(aLen);
+        p.srcStride = static_cast<uint32_t>(k_ - aLen);
+        DataCopyPad(aT, gX1_[m0 * k_ + k0], p, pad);
+        aPitch_ = aLen;
+    } else {
+        if (rows > 32) {
+            return false;
+        }
+        p.blockCount = static_cast<uint16_t>(aLen);
+        p.blockLen = static_cast<uint32_t>(rows);
+        p.srcStride = static_cast<uint32_t>(m_ - rows);
+        DataCopyPad(aT, gX1_[k0 * m_ + m0], p, pad);
+        aPitch_ = 32;
+    }
+    /* a scalar read of UB has to wait for the MTE2 copy, a vector wait is not enough */
+    SetFlag<HardEvent::MTE2_S>(mte2sEvt_);
+    WaitFlag<HardEvent::MTE2_S>(mte2sEvt_);
+    return true;
+}
+
+/* Copy the TILE_K x cols slice of B that starts at (k0, n0) into the int8 tile.
+ * In both layouts the slice is fetched with one strided copy: a block is the run of
+ * contiguous elements of the stored layout, and for the (n, k) layout the staging
+ * slice is then reordered into the (k, n) tile with scalar moves. */
+template <typename T>
+__aicore__ inline void QuantBatchMatMulV3<T>::LoadBTile(const LocalTensor<int8_t>& b, int64_t k0, int64_t n0,
+                                                        int64_t kb, int64_t cols)
+{
+    DataCopyExtParams p;
+    p.blockCount = 1;
+    p.blockLen = static_cast<uint32_t>(cols);
+    p.srcStride = 0;
+    p.dstStride = 0;
+    p.rsv = 0;
+    DataCopyPadExtParams<int8_t> pad{false, 0, 0, 0};
+    if (!transB_) {
+        if ((cols % 32) == 0) {
+            /* the whole tile in one strided copy: every row is a block and the UB side
+             * gap is expressed in 32 B units, so the rows keep the LANE_N pitch */
+            p.blockCount = static_cast<uint16_t>(kb);
+            p.blockLen = static_cast<uint32_t>(cols);
+            p.srcStride = static_cast<uint32_t>(n_ - cols);
+            p.dstStride = static_cast<uint32_t>((LANE_N - cols) / 32);
+            DataCopyPad(b, gX2_[k0 * n_ + n0], p, pad);
+        } else {
+            for (int64_t kk = 0; kk < kb; ++kk) {
+                DataCopyPad(b[kk * LANE_N], gX2_[(k0 + kk) * n_ + n0], p, pad);
+            }
+        }
+        return;
+    }
+    if ((kb % 32) == 0) {
+        /* x2 stored as (n, k): one block per output column, blockLen = kb */
+        LocalTensor<int8_t> bt = bT_.Get<int8_t>();
+        p.blockCount = static_cast<uint16_t>(cols);
+        p.blockLen = static_cast<uint32_t>(kb);
+        p.srcStride = static_cast<uint32_t>(k_ - kb);
+        p.dstStride = 0;
+        DataCopyPad(bt, gX2_[n0 * k_ + k0], p, pad);
+        SetFlag<HardEvent::MTE2_S>(mte2sEvt_);
+        WaitFlag<HardEvent::MTE2_S>(mte2sEvt_);
+        for (int64_t kk = 0; kk < kb; ++kk) {
+            for (int64_t j = 0; j < cols; ++j) {
+                b.SetValue(static_cast<int32_t>(kk * LANE_N + j),
+                           bt.GetValue(static_cast<int32_t>(j * kb + kk)));
+            }
+        }
+        /* the scalar moves above have to be visible to the vector convert below */
+        PipeBarrier<PIPE_ALL>();
+        return;
+    }
+    for (int64_t kk = 0; kk < kb; ++kk) {
+        for (int64_t j = 0; j < cols; ++j) {
+            b.SetValue(static_cast<int32_t>(kk * LANE_N + j), gX2_.GetValue((n0 + j) * k_ + k0 + kk));
+        }
+    }
+}
+
+/* GEMM + epilogue for the rows [m0, m0 + rows). */
+template <typename T>
+__aicore__ inline void QuantBatchMatMulV3<T>::RowTile(int64_t m0, int64_t rows)
+{
+    LocalTensor<half> bH = bH_.Get<half>();
+    LocalTensor<float> bF = bF_.Get<float>();
+    LocalTensor<int32_t> foldI = fold_.Get<int32_t>();
+    LocalTensor<int32_t> accI = accI_.Get<int32_t>();
+    LocalTensor<float> accF = accF_.Get<float>();
+    LocalTensor<float> sV = sVec_.Get<float>();
+    LocalTensor<float> eF = eF_.Get<float>();
+    LocalTensor<int8_t> aT = aTile_.Get<int8_t>();
+
+    const uint32_t tileElems = static_cast<uint32_t>(TILE_M * LANE_N);
+    const uint32_t lanes = static_cast<uint32_t>(LANE_N);
+
+    for (int64_t n0 = 0; n0 < n_; n0 += LANE_N) {
+        const int64_t cols = MinI(LANE_N, n_ - n0);
+        LoadScale(n0, cols);
+        Duplicate(accI, 0, tileElems);
+
+        for (int64_t a0 = 0; a0 < k_; a0 += A_TILE_K) {
+            const int64_t aLen = MinI(A_TILE_K, k_ - a0);
+            /* every scalar read of the previous chunk already retired */
+            PipeBarrier<PIPE_ALL>();
+            const bool aFromUb = LoadATile(m0, a0, rows, aLen);
+            const int64_t nChunk = (aLen + TILE_K - 1) / TILE_K;
+            /* prologue: fetch the first B block of this chunk so that the copy runs
+             * while the vector unit is still busy with the previous chunk */
+            LocalTensor<int8_t> bPre = inQueB_.AllocTensor<int8_t>();
+            LoadBTile(bPre, a0, n0, MinI(TILE_K, aLen), cols);
+            inQueB_.EnQue(bPre);
+
+            for (int64_t i = 0; i < nChunk; ++i) {
+                const int64_t k0 = a0 + i * TILE_K;
+                const int64_t kb = MinI(TILE_K, a0 + aLen - k0);
+                LocalTensor<int8_t> bI8 = inQueB_.DeQue<int8_t>();  // waits for this block
+                /* start the next block before the vector work, so the MTE2 latency of the
+                 * copy is hidden behind the computation of the current block */
+                if (i + 1 < nChunk) {
+                    const int64_t k1 = k0 + TILE_K;
+                    const int64_t kb1 = MinI(TILE_K, a0 + aLen - k1);
+                    LocalTensor<int8_t> bNext = inQueB_.AllocTensor<int8_t>();
+                    LoadBTile(bNext, k1, n0, kb1, cols);
+                    inQueB_.EnQue(bNext);
+                }
+
+                Cast(bH, bI8, RoundMode::CAST_NONE, static_cast<uint32_t>(kb * LANE_N));
+                Cast(bF, bH, RoundMode::CAST_NONE, static_cast<uint32_t>(kb * LANE_N));
+                inQueB_.FreeTensor(bI8);
+
+                Duplicate(accF, 0.0f, tileElems);
+                if (aFromUb) {
+                    const int64_t kOff = k0 - a0;
+                    for (int64_t kk = 0; kk < kb; ++kk) {
+                        for (int64_t r = 0; r < rows; ++r) {
+                            const int64_t ai = transA_ ? ((kOff + kk) * aPitch_ + r)
+                                                       : (r * aPitch_ + kOff + kk);
+                            const float a = static_cast<float>(
+                                static_cast<int32_t>(aT.GetValue(static_cast<int32_t>(ai))));
+                            Axpy(accF[r * LANE_N], bF[kk * LANE_N], a, static_cast<int32_t>(LANE_N));
+                        }
+                    }
+                } else {
+                    for (int64_t kk = 0; kk < kb; ++kk) {
+                        const int64_t kg = k0 + kk;
+                        for (int64_t r = 0; r < rows; ++r) {
+                            const int64_t aIdx = transA_ ? (kg * m_ + m0 + r) : ((m0 + r) * k_ + kg);
+                            const float a = static_cast<float>(static_cast<int32_t>(gX1_.GetValue(aIdx)));
+                            Axpy(accF[r * LANE_N], bF[kk * LANE_N], a, static_cast<int32_t>(LANE_N));
+                        }
+                    }
+                }
+                /* fold the fp32 block partial (an exact integer, <= 1.03e6) into int32 */
+                Cast(foldI, accF, RoundMode::CAST_RINT, tileElems);
+                Add(accI, accI, foldI, tileElems);
+            }
+        }
+
+        for (int64_t r = 0; r < rows; ++r) {
+            Cast(eF, accI[r * LANE_N], RoundMode::CAST_NONE, lanes);
+            if (scaleIsScalar_) {
+                Muls(eF, eF, scaleVal_, lanes);
+            } else {
+                Mul(eF, eF, sV, lanes);
+            }
+            Muls(eF, eF, gPt_.GetValue(m0 + r), lanes);
+            LocalTensor<bfloat16_t> oB = outQue_.AllocTensor<bfloat16_t>();
+            Cast(oB, eF, RoundMode::CAST_RINT, lanes);
+            outQue_.EnQue(oB);
+            oB = outQue_.DeQue<bfloat16_t>();
             DataCopyExtParams wp;
-            wp.blockCount = static_cast<uint16_t>(rb);
-            wp.blockLen = static_cast<uint32_t>(kc);
+            wp.blockCount = 1;
+            wp.blockLen = static_cast<uint32_t>(cols * static_cast<int64_t>(sizeof(bfloat16_t)));
             wp.srcStride = 0;
             wp.dstStride = 0;
             wp.rsv = 0;
-            DataCopyPad(d[r * kc], ub, wp);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            DataCopyPad(gOut_[(m0 + r) * n_ + n0], oB, wp);
+            outQue_.FreeTensor(oB);
         }
     }
+}
 
-    __aicore__ inline void ZeroCSlice(int64_t core, int64_t gridK)
-    {
-        LocalTensor<int32_t> z = bC_.Get<int32_t>();
-        const int64_t tile = EP_R * EP_N;
-        Duplicate(z, 0, static_cast<int32_t>(tile));
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID3);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID3);
-        const int64_t total = m_ * n_;
-        const int64_t per = ((total + gridK - 1) / gridK + tile - 1) / tile * tile;
-        const int64_t s = core * per;
-        const int64_t e = MinI(total, s + per);
-        for (int64_t off = s; off < e; off += tile) {
-            const int64_t cnt = MinI(tile, e - off);
-            DataCopyExtParams p;
-            p.blockCount = 1;
-            p.blockLen = static_cast<uint32_t>(cnt * static_cast<int64_t>(sizeof(int32_t)));
-            p.srcStride = 0; p.dstStride = 0; p.rsv = 0;
-            DataCopyPad(c_[off], z, p);
-        }
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID3);
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID3);
+template <typename T>
+__aicore__ inline void QuantBatchMatMulV3<T>::Process()
+{
+    if ((m_ <= 0) || (n_ <= 0) || (k_ <= 0)) {
+        return;
     }
-
-    /* Whole (rows x cols) sub-tile epilogue: one strided copy in, vector scaling per
-     * row (scale broadcast over the column chunk, pertoken per row), one strided copy
-     * out. Few pipe synchronisations per row chunk instead of per single row. */
-    __aicore__ inline void Epilogue(int64_t m0, int64_t cCol0, int64_t rows, int64_t cols, int64_t yCol0)
-    {
-        const bool scalarScale = (scaleLen_ <= 1);
-        const float sv = scalarScale ? scale_.GetValue(0) : 0.0f;
-        const float ptScalar = (ptLen_ <= 1) ? pt_.GetValue(0) : 0.0f;
-
-        for (int64_t c0 = 0; c0 < cols; c0 += EP_N) {
-            const int64_t ncol = MinI(EP_N, cols - c0);
-            const int64_t pitchF = ((ncol + 7) / 8) * 8;   /* 32B aligned fp32 count */
-            const int64_t pitchB = ((ncol + 15) / 16) * 16; /* 32B aligned bf16 count */
-            LocalTensor<float> sV = bS_.Get<float>();
-            if (!scalarScale) {
-                DataCopyExtParams sp;
-                sp.blockCount = 1;
-                sp.blockLen = static_cast<uint32_t>(ncol * static_cast<int64_t>(sizeof(float)));
-                sp.srcStride = 0; sp.dstStride = 0; sp.rsv = 0;
-                DataCopyPadExtParams<float> spad{false, 0, 0, 0};
-                DataCopyPad(sV, scale_[yCol0 + c0], sp, spad);
-                SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
-                WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
-            }
-            for (int64_t r0 = 0; r0 < rows; r0 += EP_R) {
-                const int64_t rb = MinI(EP_R, rows - r0);
-                LocalTensor<int32_t> qc = bC_.Get<int32_t>();
-                DataCopyExtParams cp;
-                cp.blockCount = static_cast<uint16_t>(rb);
-                cp.blockLen = static_cast<uint32_t>(ncol * static_cast<int64_t>(sizeof(int32_t)));
-                cp.srcStride = static_cast<uint32_t>((cPitch_ - ncol) * static_cast<int64_t>(sizeof(int32_t)));
-                cp.dstStride = static_cast<uint32_t>((pitchF - ncol) * static_cast<int64_t>(sizeof(int32_t)) / 32);
-                cp.rsv = 0;
-                DataCopyPadExtParams<int32_t> cpad{false, 0, 0, 0};
-                DataCopyPad(qc, cEpi_[((m0 + r0) * cPitch_ + cCol0) + c0], cp, cpad);
-                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-
-                LocalTensor<float> ptB = bPt_.Get<float>();
-                if (ptLen_ > 1) {
-                    DataCopyExtParams pp;
-                    pp.blockCount = 1;
-                    pp.blockLen = static_cast<uint32_t>(rb * static_cast<int64_t>(sizeof(float)));
-                    pp.srcStride = 0; pp.dstStride = 0; pp.rsv = 0;
-                    DataCopyPadExtParams<float> ppad{false, 0, 0, 0};
-                    DataCopyPad(ptB, pt_[m0 + r0], pp, ppad);
-                    SetFlag<HardEvent::MTE2_V>(EVENT_ID2);
-                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID2);
-                }
-                LocalTensor<float> f = bF_.Get<float>();
-                for (int64_t r = 0; r < rb; ++r) {
-                    const float pv = (ptLen_ <= 1) ? ptScalar : ptB.GetValue(static_cast<int32_t>(r));
-                    Cast(f[r * pitchF], qc[r * pitchF], RoundMode::CAST_NONE, static_cast<int32_t>(ncol));
-                    if (scalarScale) {
-                        Muls(f[r * pitchF], f[r * pitchF], sv, static_cast<int32_t>(ncol));
-                    } else {
-                        Mul(f[r * pitchF], f[r * pitchF], sV, static_cast<int32_t>(ncol));
-                    }
-                    Muls(f[r * pitchF], f[r * pitchF], pv, static_cast<int32_t>(ncol));
-                }
-                LocalTensor<bfloat16_t> qy = bQ_.Get<bfloat16_t>();
-                for (int64_t r = 0; r < rb; ++r) {
-                    Cast(qy[r * pitchB], f[r * pitchF], RoundMode::CAST_RINT, static_cast<int32_t>(ncol));
-                }
-                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-                WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-                DataCopyExtParams wp;
-                wp.blockCount = static_cast<uint16_t>(rb);
-                wp.blockLen = static_cast<uint32_t>(ncol * static_cast<int64_t>(sizeof(bfloat16_t)));
-                wp.srcStride = static_cast<uint32_t>((pitchB - ncol) * static_cast<int64_t>(sizeof(bfloat16_t)) / 32);
-                wp.dstStride = static_cast<uint32_t>((yPitch_ - ncol) * static_cast<int64_t>(sizeof(bfloat16_t)));
-                wp.rsv = 0;
-                DataCopyPad(y_[((m0 + r0) * yPitch_ + yCol0) + c0], qy, wp);
-                SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                /* bC_/bF_/bQ_ reused by the next row chunk: WAR on the vector reads */
-                SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            }
-        }
+    int64_t blocks = static_cast<int64_t>(GetBlockNum());
+    if (blocks <= 0) {
+        blocks = 1;
     }
+    blockIdx_ = static_cast<int64_t>(GetBlockIdx());
+    if (blockIdx_ < 0) {
+        blockIdx_ = 0;
+    }
+    rowsPerCore_ = (m_ + blocks - 1) / blocks;
+    if (rowsPerCore_ <= 0) {
+        rowsPerCore_ = 1;
+    }
+    const int64_t mStart = blockIdx_ * rowsPerCore_;
+    const int64_t mEnd = MinI(m_, mStart + rowsPerCore_);
+    for (int64_t m = mStart; m < mEnd; m += TILE_M) {
+        RowTile(m, MinI(TILE_M, mEnd - m));
+    }
+}
 
-    GlobalTensor<int8_t> x1_;
-    GlobalTensor<int8_t> x2_;
-    GlobalTensor<float> scale_;
-    GlobalTensor<float> pt_;
-    GlobalTensor<bfloat16_t> y_;
-    GlobalTensor<int32_t> c_;
-    GlobalTensor<int32_t> cEpi_;
-    int64_t cPitch_ = 0, yPitch_ = 0;
-    int64_t cStgReg_ = 0, bStgReg_ = 0, nStgOff_ = 0;
-    TBuf<TPosition::VECCALC> bC_;
-    TBuf<TPosition::VECCALC> bF_;
-    TBuf<TPosition::VECCALC> bS_;
-    TBuf<TPosition::VECCALC> bQ_;
-    TBuf<TPosition::VECCALC> bPt_;
-    TBuf<TPosition::VECCALC> stageBuf_;
-    GM_ADDR wsBase_ = nullptr;
-    GM_ADDR x1Base_ = nullptr;
-    GM_ADDR x2Base_ = nullptr;
-    int64_t cBytes_ = 0, aReg_ = 0, bReg_ = 0;
-    const QuantBatchMatMulV3TilingData* t_ = nullptr;
-    int64_t m_ = 0, n_ = 0, k_ = 0;
-    int32_t scaleLen_ = 1, ptLen_ = 1;
-};
-
-}  // namespace NsQBMM
-#endif
+}  // namespace NsQuantBatchMatMulV3
+#endif  // QUANTBATCHMATMULV3_H

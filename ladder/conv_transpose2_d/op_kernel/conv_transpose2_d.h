@@ -83,12 +83,7 @@ private:
     // vector path
     __aicore__ inline void VectorProcess();
     __aicore__ inline void LoadXRow(int64_t off, int64_t win);
-    __aicore__ inline void LoadXSeg(int64_t off, int64_t segLen);
-    __aicore__ inline void BuildIdx(int64_t ow0);
-    __aicore__ inline void BuildIdxSeg(int64_t ow0, int64_t segStart, int64_t segLen);
-    __aicore__ inline void ComputeSeg(int64_t ow0, int64_t blkLen, int64_t& segStart, int64_t& segLen);
-    __aicore__ inline void DoRow(int64_t n, int64_t co, int64_t oh, int64_t ow0, int64_t blkLen,
-                                 int64_t segStart, int64_t segLen);
+    __aicore__ inline void DoRow(int64_t n, int64_t co, int64_t oh);
     __aicore__ inline void FoldChunk(const LocalTensor<float>& acc, const LocalTensor<float>& tmp);
 
 private:
@@ -137,8 +132,6 @@ private:
     int64_t accSize_ = 64;
     int64_t p2_ = 128;
     int64_t zoff_ = 64;
-    int32_t winSeg_ = 0;
-    int64_t winSegSize_ = 0;
 };
 
 template <typename T>
@@ -187,44 +180,13 @@ __aicore__ inline void ConvTranspose2D<T>::Init(GM_ADDR x, GM_ADDR w, GM_ADDR b,
     }
 
     int64_t woutPad = Ceil64(wout_);
-    winSeg_ = td_.winSeg;
-    winSegSize_ = td_.winSegSize;
-    if (winSeg_ != 0) {
-        // only a slice of the x row lives in UB
-        p2_ = winSegSize_ + 64;
-        zoff_ = winSegSize_;
-    } else {
-        p2_ = Ceil64(win_ + 64);
-        zoff_ = Ceil64(win_);
-    }
-    if (td_.owBlockSize > 0) {
-        accSize_ = td_.owBlockSize;
-    } else {
-        wb_ = woutPad < 256 ? woutPad : 256;
-        if (wb_ < 64) {
-            wb_ = 64;
-        }
-        accSize_ = ((woutPad + wb_ - 1) / wb_) * wb_;
-    }
-    accSize_ = Ceil64(accSize_);
-    if (accSize_ < 64) {
-        accSize_ = 64;
-    }
-    if (td_.wbSize > 0) {
-        wb_ = td_.wbSize;
-    } else if (accSize_ >= 256 && (accSize_ % 256) == 0) {
-        wb_ = 256;
-    } else if (accSize_ >= 128 && (accSize_ % 128) == 0) {
-        wb_ = 128;
-    } else {
-        wb_ = 64;
-    }
+    wb_ = woutPad < 256 ? woutPad : 256;
     if (wb_ < 64) {
         wb_ = 64;
     }
-    if ((accSize_ % wb_) != 0) {
-        accSize_ = ((accSize_ + wb_ - 1) / wb_) * wb_;
-    }
+    accSize_ = ((woutPad + wb_ - 1) / wb_) * wb_;
+    p2_ = Ceil64(win_ + 64);
+    zoff_ = Ceil64(win_);
 
     pipe.InitBuffer(fAcc, static_cast<uint32_t>(accSize_ * sizeof(float)));
     pipe.InitBuffer(fXg, static_cast<uint32_t>(wb_ * sizeof(float)));
@@ -245,22 +207,35 @@ __aicore__ inline void ConvTranspose2D<T>::Init(GM_ADDR x, GM_ADDR w, GM_ADDR b,
         pipe.InitBuffer(accH, static_cast<uint32_t>(accSize_ * sizeof(T)));
     }
 
-    // zero the x buffer tail once so padding lanes (and the zoff_ lane) are
-    // exactly 0.  Done for both dtypes: the float fX buffer holds the actual
-    // gather source, and for fp16 we also clear the raw staging buffer.
-    {
+    // zero the x row tail once so padding lanes (and zoff_ lane) are exactly 0
+    if constexpr (std::is_same<T, float>::value) {
         LocalTensor<float> fx = fX.Get<float>();
         Duplicate(fx, 0.0f, static_cast<uint32_t>(p2_));
-    }
-    if constexpr (!std::is_same<T, float>::value) {
+    } else {
         LocalTensor<T> xh = xhBuf.Get<T>();
         Duplicate(xh, static_cast<T>(0), static_cast<uint32_t>(p2_));
     }
 
-    // precompute per-kw gather byte offsets into fX (float) for the first block
-    if (winSeg_ == 0) {
-        BuildIdx(0);
+    // precompute per-kw gather byte offsets into fX (float)
+    LocalTensor<int32_t> idx = idxTab.Get<int32_t>();
+    const int32_t zeroOff = static_cast<int32_t>(zoff_ * 4);
+    for (int64_t kw = 0; kw < kw_; ++kw) {
+        int64_t baseK = kw * accSize_;
+        for (int64_t ow = 0; ow < accSize_; ++ow) {
+            int32_t off = zeroOff;
+            if (ow < wout_) {
+                int64_t t = ow + pad_ - kw * dil_;
+                if (t >= 0 && (t % stride_) == 0) {
+                    int64_t iw = t / stride_;
+                    if (iw < win_) {
+                        off = static_cast<int32_t>(iw * 4);
+                    }
+                }
+            }
+            idx.SetValue(static_cast<int32_t>(baseK + ow), off);
+        }
     }
+    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename T>
@@ -283,115 +258,6 @@ __aicore__ inline void ConvTranspose2D<T>::LoadXRow(int64_t off, int64_t win)
         Cast(fx, xh, RoundMode::CAST_NONE, static_cast<int32_t>(p2_));
     }
     PipeBarrier<PIPE_ALL>();  // MTE2 -> V
-}
-
-// Build the per-kw Gather byte-offset table for the output columns
-// [ow0, ow0 + accSize_).  Entry (kw, j) points at the float lane of fX that
-// holds x[n,ci,ih, iw] for global output column ow = ow0 + j, or at the zero
-// lane when that column has no valid input for this tap.
-template <typename T>
-__aicore__ inline void ConvTranspose2D<T>::BuildIdx(int64_t ow0)
-{
-    LocalTensor<int32_t> idx = idxTab.Get<int32_t>();
-    const int32_t zeroOff = static_cast<int32_t>(zoff_ * 4);
-    for (int64_t kw = 0; kw < kw_; ++kw) {
-        int64_t baseK = kw * accSize_;
-        for (int64_t j = 0; j < accSize_; ++j) {
-            int64_t ow = ow0 + j;
-            int32_t off = zeroOff;
-            if (ow < wout_) {
-                int64_t t = ow + pad_ - kw * dil_;
-                if (t >= 0 && (t % stride_) == 0) {
-                    int64_t iw = t / stride_;
-                    if (iw < win_) {
-                        off = static_cast<int32_t>(iw * 4);
-                    }
-                }
-            }
-            idx.SetValue(static_cast<int32_t>(baseK + j), off);
-        }
-    }
-    PipeBarrier<PIPE_ALL>();
-}
-
-// Load only the x slice [segStart, segStart+segLen) of one input row into fX.
-template <typename T>
-__aicore__ inline void ConvTranspose2D<T>::LoadXSeg(int64_t off, int64_t segLen)
-{
-    if (segLen <= 0) {
-        return;
-    }
-    LocalTensor<float> fx = fX.Get<float>();
-    PipeBarrier<PIPE_ALL>();  // V(read fX) -> MTE2(write fX), WAR
-    DataCopyExtParams p;
-    p.blockCount = 1;
-    p.blockLen = static_cast<uint32_t>(segLen * sizeof(T));
-    p.srcStride = 0;
-    p.dstStride = 0;
-    p.rsv = 0;
-    if constexpr (std::is_same<T, float>::value) {
-        DataCopyPad(fx, xGm[off], p, DataCopyPadExtParams<T>{false, 0, 0, 0});
-    } else {
-        LocalTensor<T> xh = xhBuf.Get<T>();
-        DataCopyPad(xh, xGm[off], p, DataCopyPadExtParams<T>{false, 0, 0, 0});
-        PipeBarrier<PIPE_ALL>();  // MTE2 -> V
-        Cast(fx, xh, RoundMode::CAST_NONE, static_cast<int32_t>(Ceil64(segLen)));
-    }
-    PipeBarrier<PIPE_ALL>();  // MTE2 -> V
-}
-
-// Input-column range needed to produce output columns [ow0, ow0+blkLen).
-// Covers every tap kw in [0, kw_): iw = (ow + pad - kw*dil) / stride.
-template <typename T>
-__aicore__ inline void ConvTranspose2D<T>::ComputeSeg(int64_t ow0, int64_t blkLen, int64_t& segStart, int64_t& segLen)
-{
-    int64_t loT = ow0 + pad_ - (kw_ - 1) * dil_;
-    if (loT < 0) {
-        loT = 0;
-    }
-    int64_t hiT = ow0 + blkLen - 1 + pad_;
-    int64_t iwLo = loT / stride_;
-    int64_t iwHi = hiT / stride_;
-    if (iwLo < 0) {
-        iwLo = 0;
-    }
-    if (iwHi > win_ - 1) {
-        iwHi = win_ - 1;
-    }
-    if (iwHi < iwLo || iwLo >= win_) {
-        segStart = 0;
-        segLen = 0;
-        return;
-    }
-    segStart = iwLo;
-    segLen = iwHi - iwLo + 1;
-}
-
-// Gather offset table relative to the loaded x slice [segStart, segStart+segLen).
-template <typename T>
-__aicore__ inline void ConvTranspose2D<T>::BuildIdxSeg(int64_t ow0, int64_t segStart, int64_t segLen)
-{
-    LocalTensor<int32_t> idx = idxTab.Get<int32_t>();
-    const int32_t zeroOff = static_cast<int32_t>(zoff_ * 4);
-    const int64_t segEnd = segStart + segLen;
-    for (int64_t kw = 0; kw < kw_; ++kw) {
-        int64_t baseK = kw * accSize_;
-        for (int64_t j = 0; j < accSize_; ++j) {
-            int64_t ow = ow0 + j;
-            int32_t off = zeroOff;
-            if (ow < wout_) {
-                int64_t t = ow + pad_ - kw * dil_;
-                if (t >= 0 && (t % stride_) == 0) {
-                    int64_t iw = t / stride_;
-                    if (iw >= segStart && iw < segEnd && iw < win_) {
-                        off = static_cast<int32_t>((iw - segStart) * 4);
-                    }
-                }
-            }
-            idx.SetValue(static_cast<int32_t>(baseK + j), off);
-        }
-    }
-    PipeBarrier<PIPE_ALL>();
 }
 
 // fold the (ci,kh) chunk accumulator into the row accumulator.
@@ -423,8 +289,7 @@ __aicore__ inline void ConvTranspose2D<T>::FoldChunk(const LocalTensor<float>& a
 }
 
 template <typename T>
-__aicore__ inline void ConvTranspose2D<T>::DoRow(int64_t n, int64_t co, int64_t oh, int64_t ow0, int64_t blkLen,
-                                                 int64_t segStart, int64_t segLen)
+__aicore__ inline void ConvTranspose2D<T>::DoRow(int64_t n, int64_t co, int64_t oh)
 {
     LocalTensor<float> acc = fAcc.Get<float>();
     LocalTensor<float> xg = fXg.Get<float>();
@@ -461,11 +326,7 @@ __aicore__ inline void ConvTranspose2D<T>::DoRow(int64_t n, int64_t co, int64_t 
             if (ih >= hin_) {
                 continue;
             }
-            if (winSeg_ != 0) {
-                LoadXSeg(xCiN + ih * win_ + segStart, segLen);
-            } else {
-                LoadXRow(xCiN + ih * win_, win_);
-            }
+            LoadXRow(xCiN + ih * win_, win_);
             if (accMode_ == 2) {
                 // reference order: inside one tap the channels are accumulated
                 // in ascending order, so every tap keeps its own accumulator
@@ -524,22 +385,22 @@ __aicore__ inline void ConvTranspose2D<T>::DoRow(int64_t n, int64_t co, int64_t 
     if constexpr (std::is_same<T, float>::value) {
         DataCopyExtParams p;
         p.blockCount = 1;
-        p.blockLen = static_cast<uint32_t>(blkLen * sizeof(float));
+        p.blockLen = static_cast<uint32_t>(wout_ * sizeof(float));
         p.srcStride = 0;
         p.dstStride = 0;
         p.rsv = 0;
-        DataCopyPad(yGm[rowBase + ow0], acc, p);
+        DataCopyPad(yGm[rowBase], acc, p);
     } else {
         LocalTensor<T> ah = accH.Get<T>();
         Cast(ah, acc, RoundMode::CAST_RINT, static_cast<int32_t>(accSize_));
         PipeBarrier<PIPE_ALL>();  // V -> MTE3
         DataCopyExtParams p;
         p.blockCount = 1;
-        p.blockLen = static_cast<uint32_t>(blkLen * sizeof(T));
+        p.blockLen = static_cast<uint32_t>(wout_ * sizeof(T));
         p.srcStride = 0;
         p.dstStride = 0;
         p.rsv = 0;
-        DataCopyPad(yGm[rowBase + ow0], ah, p);
+        DataCopyPad(yGm[rowBase], ah, p);
     }
     PipeBarrier<PIPE_ALL>();  // MTE3 done before next row reuse
 }
@@ -564,31 +425,12 @@ __aicore__ inline void ConvTranspose2D<T>::VectorProcess()
         return;
     }
     const int64_t rowsHW = chOut_ * hout_;
-    const int64_t nBlocks = (wout_ + accSize_ - 1) / accSize_;
-    for (int64_t b = 0; b < nBlocks; ++b) {
-        int64_t ow0 = b * accSize_;
-        int64_t blkLen = wout_ - ow0;
-        if (blkLen > accSize_) {
-            blkLen = accSize_;
-        }
-        if (blkLen <= 0) {
-            break;
-        }
-        int64_t segStart = 0;
-        int64_t segLen = 0;
-        if (winSeg_ != 0) {
-            ComputeSeg(ow0, blkLen, segStart, segLen);
-            BuildIdxSeg(ow0, segStart, segLen);
-        } else {
-            BuildIdx(ow0);  // offset table is independent of the row
-        }
-        for (int64_t rid = s; rid < e; ++rid) {
-            int64_t n = rid / rowsHW;
-            int64_t rr = rid - n * rowsHW;
-            int64_t co = rr / hout_;
-            int64_t oh = rr - co * hout_;
-            DoRow(n, co, oh, ow0, blkLen, segStart, segLen);
-        }
+    for (int64_t rid = s; rid < e; ++rid) {
+        int64_t n = rid / rowsHW;
+        int64_t rr = rid - n * rowsHW;
+        int64_t co = rr / hout_;
+        int64_t oh = rr - co * hout_;
+        DoRow(n, co, oh);
     }
 }
 

@@ -167,6 +167,10 @@ static ge::graphStatus Gf2kMulSquareTilingFunc(gert::TilingContext* context)
     if (rowsPerCore < 1) {
         rowsPerCore = 1;
     }
+    // k=8 vector path packs two rows per int16 lane; keep each core start even.
+    if (kVal == 8 && (rowsPerCore % 2) != 0) {
+        rowsPerCore += 1;
+    }
     bd = CeilDiv(totalRows, rowsPerCore);
     if (bd < 1) {
         bd = 1;

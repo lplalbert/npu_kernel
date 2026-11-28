@@ -4,8 +4,12 @@
  *
  * Splits the flat element dim across AI vector cores. Inner UB chunk (ubFactor)
  * is always a multiple of 64 elements so that every vector op count is one or
- * more full 256B repeats (fast path). fp32 reduction uses all cores with a 32B
- * atomic add for the cross-core combine; fp16 reduction runs single core.
+ * more full 256B repeats (fast path). Per-core element windows are also aligned
+ * to 64 elements, so no core starts or ends inside a 32B GM block and the tail
+ * DataCopyPad of one core can never overlap the bytes of another core.
+ * fp32 reduction uses all cores with a 32B atomic add for the cross-core combine
+ * (MSELOSS_DET_REDUCE == 0) or a single core when deterministic reduction is
+ * requested; fp16 reduction always runs single core.
  */
 
 #include "register/op_def_registry.h"
@@ -23,6 +27,8 @@ constexpr uint32_t WS_SYS_SIZE = 0U;
 constexpr int64_t kElemAlign = 64;      // vector op count alignment
 constexpr int64_t kMaxUb = 8192;        // upper bound on inner chunk elements
 constexpr int64_t kMinPerCore = 8192;   // do not spawn a core for < this many elem
+constexpr int64_t kSlotFloats = 8;      // 32B per-core partial-output slot
+constexpr int64_t kMaxReduceCores = 128;
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
 {
@@ -53,11 +59,6 @@ static ge::graphStatus MseLossTilingFunc(gert::TilingContext* context)
         OP_LOGE(context, "GetPlatformInfo error"),
         return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(
-        GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
-        OP_LOGE(context, "GetWorkspaceSize error"),
-        return ge::GRAPH_FAILED);
-
     MseLossTilingData* tiling = context->GetTilingData<MseLossTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
 
@@ -75,8 +76,9 @@ static ge::graphStatus MseLossTilingFunc(gert::TilingContext* context)
     uint64_t tilingKey;
     bool isF16 = false;
     auto inputDesc = context->GetInputDesc(0);
-    if (inputDesc != nullptr &&
-        (inputDesc->GetDataType() == ge::DT_FLOAT16 || inputDesc->GetDataType() == ge::DT_BF16)) {
+    // Only the dtypes declared in the op def are dispatched here: float16 uses
+    // the half kernel template, everything else (float32) the float template.
+    if (inputDesc != nullptr && inputDesc->GetDataType() == ge::DT_FLOAT16) {
         tilingKey = GET_TPL_TILING_KEY(MSELOSS_TPL_SCH_MODE_0);
         isF16 = true;
     } else {
@@ -139,8 +141,14 @@ static ge::graphStatus MseLossTilingFunc(gert::TilingContext* context)
     }
 
     int64_t cores = coreNum;
-    if (reduction != 0 && isF16) {
-        cores = 1; // half atomic add is unreliable -> single core for fp16 reduction
+    if (reduction != 0 && MSELOSS_DET_REDUCE) {
+        // fp32 reduction collapses to one core when bitwise repeatability is
+        // requested (see MSELOSS_DET_REDUCE in mse_loss_tiling_key.h). fp16
+        // reduction now runs multi-core: partial fp32 sums go to a workspace
+        // slot per core, a grid barrier SyncAll() orders them, and core 0
+        // combines + casts to the half output. This matches the reference
+        // bandwidth instead of the old single-core (15x slower) path.
+        cores = 1;
     }
     int64_t need = (total + kMinPerCore - 1) / kMinPerCore;
     if (need < cores) {
@@ -149,19 +157,42 @@ static ge::graphStatus MseLossTilingFunc(gert::TilingContext* context)
     if (cores < 1) {
         cores = 1;
     }
+    if (cores > kMaxReduceCores) {
+        cores = kMaxReduceCores;
+    }
     int64_t per = (total + cores - 1) / cores;
     if (per < 1) {
         per = 1;
     }
+    // Align the per-core element window to the vector alignment so that every
+    // core owns whole 32B GM blocks; the tail DataCopyPad of a core then pads
+    // inside its own window instead of touching a neighbour's bytes.
+    per = ((per + kElemAlign - 1) / kElemAlign) * kElemAlign;
 
-    tiling->totalNum = total;
-    tiling->blockFactor = per;
-    tiling->ubFactor = ub;
-    tiling->reduction = reduction;
+    tiling->totalNum = static_cast<int32_t>(total);
+    tiling->blockFactor = static_cast<int32_t>(per);
+    tiling->ubFactor = static_cast<int32_t>(ub);
+    tiling->reduction = static_cast<int32_t>(reduction);
     tiling->usedCores = static_cast<int32_t>(cores);
 
     context->SetBlockDim(static_cast<uint32_t>(cores));
     context->SetTilingKey(tilingKey);
+
+    // Reduction (mean/sum) needs, per core, one fp32 partial slot (32B) plus one
+    // int32 arrival tag (32B) for the GM-flag cross-core combine -> 64B/core.
+    // The lib-api/system workspace prefix must precede the user area, and only
+    // GetUserWorkspace() knows its length, so request sysWs + user here.
+    // Elementwise (none) needs no workspace.
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    size_t sysWs = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    OP_CHECK_NULL_WITH_CONTEXT(context, workspace);
+    if (reduction != 0) {
+        workspace[0] = sysWs + static_cast<size_t>(cores) * static_cast<size_t>(kSlotFloats) *
+                                    (sizeof(float) + sizeof(int32_t)) + 512U;
+    } else {
+        workspace[0] = WS_SYS_SIZE;
+    }
     return ge::GRAPH_SUCCESS;
 }
 

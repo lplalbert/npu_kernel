@@ -2,18 +2,14 @@
  * \file depthwise_conv2_d_tiling.cpp
  * \brief DepthwiseConv2D tiling.
  *
- * Work distribution: the output is split into "row groups".  A group produces
- * R consecutive output rows of one (n, c) channel plane at once, packed into a
- * single vector of length count = align64(R*wout).  Grouping amortises the
- * per-row fixed cost (barriers, tiny GM copies, short vectors) that dominates
- * when wout is small, and lengthens every vector op.  Groups are partitioned
- * into disjoint contiguous ranges across AIV cores: no cross-core reduction,
- * no synchronisation, no workspace.
+ * Work distribution: output rows (n, c, oh) are split into disjoint contiguous
+ * ranges across AIV cores. Each core fully owns the rows of its range, so there
+ * is no cross-core reduction, no synchronisation and no workspace usage; the
+ * result is deterministic by construction.
  *
- * The vector path also needs a single gather offset table of `count` int32 and
- * one input tile of rowSpan*WPtile floats.  The host checks that footprint
- * against the UB budget and falls back to an element-wise scalar path when it
- * does not fit.
+ * The vector path needs a per-kw gather offset table of kw*accSize int32 plus a
+ * few row sized float buffers. The host checks that footprint against the UB
+ * budget and falls back to the element-wise scalar path when it does not fit.
  */
 
 #include "register/op_def_registry.h"
@@ -28,25 +24,15 @@ namespace optiling {
 using Ops::Base::CeilDiv;
 
 constexpr uint32_t WS_SYS_SIZE = 0U;
-constexpr int64_t STAGE_CHUNK = 1024;    /* scalar path staging chunk, mult of 64 */
-constexpr int64_t MIN_VEC_ELEMS = 64;    /* smallest allowed vector op count */
-constexpr int64_t MAX_VEC_COUNT = 16320; /* 255 repeats * 64 elements */
-constexpr int64_t PREF_VEC_COUNT = 8192; /* preferred upper bound on the vector length */
-constexpr int64_t MAX_R = 64;            /* hard cap on rows per group */
-constexpr int64_t UB_BUDGET_NUM = 9;     /* used fraction of UB: 9/10 */
+constexpr int64_t STAGE_CHUNK = 1024;   /* scalar path staging chunk, mult of 64 */
+constexpr int64_t MIN_VEC_ELEMS = 64;   /* smallest allowed vector op count */
+constexpr int64_t MAX_VEC_COUNT = 16320;/* 255 repeats * 64 elements */
+constexpr int64_t UB_BUDGET_NUM = 7;    /* used fraction of UB: 7/10 */
 constexpr int64_t UB_BUDGET_DEN = 10;
 
 static inline int64_t Align64(int64_t v)
 {
     return ((v + 63) / 64) * 64;
-}
-static inline int64_t Align8(int64_t v)
-{
-    return ((v + 7) / 8) * 8;
-}
-static inline int64_t Align16(int64_t v)
-{
-    return ((v + 15) / 16) * 16;
 }
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
@@ -77,6 +63,7 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
         GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS,
         OP_LOGE(context, "GetPlatformInfo error"),
         return ge::GRAPH_FAILED);
+
     OP_CHECK_IF(
         GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
         OP_LOGE(context, "GetWorkspaceSize error"),
@@ -103,6 +90,8 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
     const int64_t kh = ws.GetDim(2);
     const int64_t kw = ws.GetDim(3);
 
+    /* the kernel instantiates a single element type for both x and w, so they
+     * have to share one dtype; reject fp16/fp32 mixtures before any access */
     auto xDesc = context->GetInputDesc(0);
     auto wDesc = context->GetInputDesc(1);
     OP_CHECK_IF(xDesc == nullptr || wDesc == nullptr,
@@ -158,94 +147,33 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
     }
 
     const int64_t totalOut = n * chIn * hout * wout;
+    const int64_t totalRows = n * chIn * hout;
+
     auto inputDesc = context->GetInputDesc(0);
     const bool isF16 = (inputDesc != nullptr &&
                         (inputDesc->GetDataType() == ge::DT_FLOAT16 || inputDesc->GetDataType() == ge::DT_BF16));
 
-    /* ---- geometry mirrored exactly by the kernel ---- */
-    /* LP is a multiple of 16 so that half-typed tile rows written directly into
-     * UB are 32B aligned; WPtile is a multiple of 64 so a whole-tile Cast has a
-     * length that is a multiple of 64. */
-    const int64_t LP = Align16(pad);
-    int64_t colMax = (wout - 1) * stride + (kw - 1) * dil - pad + LP;
-    int64_t needW = colMax + 1;
-    int64_t needW2 = LP + win + 64;
-    const int64_t WPtile = Align64((needW > needW2) ? needW : needW2);
+    /* vector path geometry mirrored by the kernel */
+    const int64_t accSize = Align64(wout);
+    const int64_t zoff = Align64(win) + 64; /* one spare block above the row */
+    const int64_t xSize = zoff + 64;
     const int64_t wPad = Align64(kh * kw);
 
+    int64_t vecFloats = xSize + accSize + accSize + wPad + kw * accSize;
+    if (isF16) {
+        vecFloats += (xSize + wPad + accSize) / 2; /* io dtype staging buffers */
+    }
     const int64_t ubBudget = static_cast<int64_t>(ubSize) * UB_BUDGET_NUM / UB_BUDGET_DEN;
 
-    /* choose R: largest row-group size that fits UB and the vector-length limits
-     * and still leaves at least coreNum groups whenever possible */
-    int64_t rByCount = PREF_VEC_COUNT / (wout > 0 ? wout : 1);
-    if (rByCount < 1) {
-        rByCount = 1;
-    }
-    int64_t rCap = hout;
-    if (rCap > rByCount) {
-        rCap = rByCount;
-    }
-    if (rCap > MAX_R) {
-        rCap = MAX_R;
-    }
-    if (rCap < 1) {
-        rCap = 1;
-    }
-
-    /* minimum row-group size that fills a whole vector lane set: with fewer rows
-     * than this, count is padded to 64 lanes and most lanes are wasted, which is
-     * far more expensive on tiny shapes than using fewer cores. */
-    int64_t rFill = (64 + (wout > 0 ? wout : 1) - 1) / (wout > 0 ? wout : 1);
-    if (rFill < 1) { rFill = 1; }
-    if (rFill > rCap) { rFill = rCap; }
-
     int32_t useScalar = 0;
-    int64_t R = 0;
-    int64_t rowSpan = 1;
-    int64_t count = 64;
-    bool found = false;
-    for (int64_t r = rCap; r >= 1; --r) {
-        int64_t rs = (r - 1) * stride + (kh - 1) * dil + 1;
-        int64_t ct = Align64(r * wout);
-        if (ct > MAX_VEC_COUNT) {
-            continue;
-        }
-        int64_t tileB = rs * WPtile * 4;
-        int64_t accB = ct * 4 * 3; /* acc + gather dst + offset table */
-        int64_t wB = wPad * 4;
-        int64_t extra = 0;
-        if (isF16) {
-            /* full io-dtype tile staging (whole-tile Cast) + weight staging + output staging */
-            extra = rs * WPtile * 2 + wPad * 2 + ct * 2;
-        }
-        int64_t total = tileB + accB + wB + extra;
-        int64_t groups = n * chIn * CeilDiv<int64_t>(hout, r);
-        bool enoughCores = (groups >= coreNum) || (r <= rFill);
-        if (total <= ubBudget && enoughCores) {
-            R = r;
-            rowSpan = rs;
-            count = ct;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
+    if (accSize > MAX_VEC_COUNT || accSize < MIN_VEC_ELEMS || vecFloats * 4 > ubBudget) {
         useScalar = 1;
-        R = 1;
-        rowSpan = (kh - 1) * dil + 1;
-        count = Align64(wout < MIN_VEC_ELEMS ? MIN_VEC_ELEMS : wout);
     }
-    if (count < MIN_VEC_ELEMS) {
-        count = MIN_VEC_ELEMS;
-    }
-
-    const int64_t gpc = CeilDiv<int64_t>(hout, R);
-    const int64_t totalGroups = n * chIn * gpc;
 
     int64_t cores = coreNum;
     if (useScalar == 0) {
-        if (cores > totalGroups) {
-            cores = totalGroups;
+        if (cores > totalRows) {
+            cores = totalRows;
         }
     } else {
         int64_t maxCores = totalOut / 64;
@@ -259,8 +187,13 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
     if (cores < 1) {
         cores = 1;
     }
+    int64_t rowsPerCore = CeilDiv<int64_t>(useScalar == 0 ? totalRows : totalOut, cores);
+    if (rowsPerCore < 1) {
+        rowsPerCore = 1;
+    }
 
     tiling->totalNum = totalOut;
+    tiling->blockFactor = rowsPerCore;
     tiling->ubFactor = STAGE_CHUNK;
     tiling->n = n;
     tiling->chIn = chIn;
@@ -273,17 +206,14 @@ static ge::graphStatus DepthwiseConv2DTilingFunc(gert::TilingContext* context)
     tiling->stride = stride;
     tiling->pad = pad;
     tiling->dil = dil;
-    tiling->R = R;
-    tiling->rowSpan = rowSpan;
-    tiling->LP = LP;
-    tiling->WPtile = WPtile;
-    tiling->count = count;
-    tiling->gpc = gpc;
-    tiling->totalGroups = totalGroups;
+    tiling->totalRows = totalRows;
+    tiling->accSize = accSize;
+    tiling->xSize = xSize;
+    tiling->zoff = zoff;
     tiling->wPad = wPad;
     tiling->hasBias = hasBias;
-    tiling->useScalar = useScalar;
     tiling->usedCores = static_cast<int32_t>(cores);
+    tiling->useScalar = useScalar;
 
     context->SetBlockDim(static_cast<uint32_t>(cores));
 
