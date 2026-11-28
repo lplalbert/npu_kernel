@@ -32,14 +32,30 @@
 
 ## 二、精度：本赛最大的坑
 
-### 2.1 判据（实测逆向）
+### 2.1 判据（★ 两套口径并存，以官方 compare_data.py 为准）
+
+**【权威版】官方模板自带的 `tests/ut/op_kernel/<base>_data/compare_data.py`（判题机使用）**
+```python
+MARE = np.max( |actual-golden| / np.maximum(np.abs(golden), 1e-6) )    # 最大相对误差
+MERE = np.mean( |actual-golden| / np.maximum(np.abs(golden), 1e-6) )   # 平均相对误差
+通过条件：  MERE < threshold   且   MARE < 10 * threshold
+threshold: float16 = 2^-10 = 9.77e-4  → 10× = 9.7656e-3
+           float32 = 2^-13 = 1.22e-4  → 10× = 1.2207e-3
+           bfloat16 = 2^-7  = 7.81e-3 → 10× = 7.81e-2
+```
+**关键**：`MARE` 是 **max**（不是计数比）；分母是 `max(|golden|, 1e-6)`（不是 `+1e-7`）。
+⇒ **有真实容差（fp16 约 1e-2 量级），一般不需要逐位**。
+⇒ **唯一风险是 near-zero 元素**：`|golden| < 1e-6` 时分母被钳到 1e-6，小的**绝对**误差也会放大成大的**相对**误差
+→ 对策：**near-zero 兜底**（`|y| < 1e-2·amax` 的元素用精确顺序重算，占比通常 0.1~0.5%）。
+
+**【平台侧】ranking API 的 `precision_ratio` 字段（观测用，不是判定依据）**
 ```
 precision_ratio = 1 − #(rel_err > 10 × threshold) / N
-rel_err = |out − golden| / (|golden| + 1e-7)
-fp32 threshold = 2^-13 ; fp16 阈值 ≈ 10·2^-10 ; bf16 更宽
 ```
-**42 个 Pass 队伍的 ratio 全部恰好 = 1.0；WA 队伍卡在 0.996~0.999**
-⇒ **Pass 门槛实质要求「零 mismatch」** ⇒ 量化/归约类算子**只有逐位复刻 golden 才能过**。
+历史上观察到 42 个 Pass 队伍的 `precision_ratio` 全部 = 1.0、WA 队伍卡在 0.996~0.999。
+**注意**：`precision_ratio` 只是平台展示的统计量；**真正的判定用的是上面 `compare_data.py` 的 MARE/MERE**。
+两者在「超差元素数」上正相关，**但不能由 `precision_ratio==1` 反推出"必须逐位"** —— 早期结论「只有逐位复刻才能过」是**错的**，
+正是这个错误让我们误判 Cube 路线不可行，白丢两轮（修正后 cube2/cube1/qmsq 合计 +60 分）。
 
 ### 2.2 核心原则：**「提高精度」是错的，「复刻 golden 的归约顺序」才是对的**
 实测：fp64 真值算出来比纯升序 fp32 **错得更多**（`n4_T32768`：fp64 错 148 个元素，升序错 0 个）。
